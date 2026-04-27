@@ -776,8 +776,7 @@ class DeepseekV4Experts(GptOssExperts):
     gate/up split, SiLU activation, and ``swiglu_limit`` clamping before the activation.
     """
 
-    def __init__(self, config: DeepseekV4Config):
-        nn.Module.__init__(self)
+        super().__init__(config)
         del self.gate_up_proj_bias 
         del self.down_proj_bias
         del self.alpha
