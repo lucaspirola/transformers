@@ -270,7 +270,7 @@ class DeepseekV4ParityTest(unittest.TestCase):
             max_position_embeddings=512,
             compress_rate_hca=128,
         )
-        compressor = DeepseekV4Compressor(config, compress_rate=128, with_indexer=False).eval()
+        compressor = DeepseekV4Compressor(config, compress_rate=128).eval()
         # Initialise ``window_pos_bias`` to non-zero so the test exercises the pooling math.
         torch.nn.init.normal_(compressor.window_pos_bias, std=0.1)
 
@@ -278,19 +278,13 @@ class DeepseekV4ParityTest(unittest.TestCase):
         hidden_states = torch.randn(batch, seq_len, config.hidden_size)
 
         cache_full = DeepseekV4Cache(config=config)
-        position_ids_full = torch.arange(seq_len).unsqueeze(0)
         with torch.no_grad():
-            one_shot = compressor(hidden_states, None, position_ids_full, cache_full.layers[1])
+            one_shot = compressor(hidden_states, cache_full.layers[1])
 
         cache_inc = DeepseekV4Cache(config=config)
         with torch.no_grad():
             for step in range(seq_len):
-                incremental = compressor(
-                    hidden_states[:, step : step + 1],
-                    None,
-                    torch.tensor([[step]]),
-                    cache_inc.layers[1],
-                )
+                incremental = compressor(hidden_states[:, step : step + 1], cache_inc.layers[1])
         self.assertEqual(one_shot.shape, incremental.shape)
         torch.testing.assert_close(one_shot, incremental, rtol=1e-4, atol=1e-5)
 

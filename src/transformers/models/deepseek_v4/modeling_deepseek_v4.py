@@ -385,21 +385,20 @@ class DeepseekV4Indexer(nn.Module):
 # -----------------------------------------------------------------------------
 # Compressor — pools ``compress_rate`` consecutive tokens into one compressed KV
 # entry via softmax over learned gate logits + window_pos_bias (paper §2.3.1 eq. 11
-# for CSA, §2.3.2 eq. 22 for HCA). Used by both CSA and HCA blocks. CSA additionally
-# wraps the running pool with a Lightning Indexer (instantiated in :class:`DeepseekV4CSA`).
+# for CSA, §2.3.2 eq. 22 for HCA). Used as a child of :class:`DeepseekV4HCA` and
+# :class:`DeepseekV4CSA`; CSA pairs it with a sibling :class:`DeepseekV4Indexer`.
 # -----------------------------------------------------------------------------
 
 
 class DeepseekV4Compressor(nn.Module):
-    """Token-level KV compressor used by CSA (paper §2.3.1) and HCA (§2.3.2). Pools
-    every ``compress_rate`` source tokens into one compressed KV entry, normalised
-    across the window with a softmax over learned gate logits + ``window_pos_bias``.
-    For CSA, ``self.indexer`` also runs and the returned pool is sparse-gathered to
-    the top-``index_topk`` blocks per query token; for HCA the full running pool is
-    returned. The result is concatenated onto the attention's sliding-window KV.
+    """Token-level KV compressor (paper §2.3.1 eqs. 9–12 for CSA, §2.3.2 eqs. 20–23
+    for HCA). Pools every ``compress_rate`` source tokens into one compressed KV
+    entry, normalised across the window with a softmax over learned gate logits
+    plus ``window_pos_bias``. Returns the running pool ``[B, 1, T, head_dim]`` —
+    sparse selection (CSA) is the caller's responsibility.
     """
 
-    def __init__(self, config: DeepseekV4Config, compress_rate: int, with_indexer: bool):
+    def __init__(self, config: DeepseekV4Config, compress_rate: int):
         super().__init__()
         self.compress_rate = compress_rate
         self.head_dim = config.head_dim
@@ -409,16 +408,9 @@ class DeepseekV4Compressor(nn.Module):
         self.window_pos_bias = nn.Parameter(torch.empty(compress_rate, self.head_dim))
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        self.indexer: DeepseekV4Indexer | None = DeepseekV4Indexer(config) if with_indexer else None
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        q_residual: torch.Tensor | None,
-        position_ids: torch.Tensor,
-        cache_layer: DeepseekV4HCALayer,
-    ) -> torch.Tensor:
-        batch, seq_len, _ = hidden_states.shape
+    def forward(self, hidden_states: torch.Tensor, cache_layer: DeepseekV4HCALayer) -> torch.Tensor:
+        batch, _, _ = hidden_states.shape
 
         kv = self.wkv(hidden_states)
         gate = self.wgate(hidden_states)
@@ -443,15 +435,7 @@ class DeepseekV4Compressor(nn.Module):
             new_pooled = torch.cat([pool_rope.squeeze(1), pool_nope], dim=-1)
         else:
             new_pooled = chunk_kv  # empty
-        pooled = cache_layer.update_compressor_pool(new_pooled).unsqueeze(1)
-
-        # CSA-only: the Lightning Indexer narrows the running pool to top-k entries per query.
-        if self.indexer is not None:
-            topk = self.indexer(hidden_states, q_residual, position_ids, cache_layer)
-            expanded = pooled.unsqueeze(2).expand(-1, -1, seq_len, -1, -1)
-            idx = topk.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, self.head_dim)
-            pooled = torch.gather(expanded, 3, idx).reshape(batch, 1, -1, self.head_dim)
-        return pooled
+        return cache_layer.update_compressor_pool(new_pooled).unsqueeze(1)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -529,7 +513,6 @@ class DeepseekV4Attention(nn.Module):
     """
 
     _cache_layer_cls = DeepseekV4SWALayer
-    _compress_rate: int = 0
 
     def __init__(self, config: DeepseekV4Config, layer_idx: int):
         super().__init__()
@@ -554,7 +537,6 @@ class DeepseekV4Attention(nn.Module):
         )
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self.sinks = nn.Parameter(torch.empty(self.num_heads))
-        self.compressor: DeepseekV4Compressor | None = None
 
     def forward(
         self,
@@ -565,30 +547,53 @@ class DeepseekV4Attention(nn.Module):
         past_key_values: Cache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Sliding-window only: no compressor / no indexer.
+        q, _, full_kv = self._qkv_and_window_kv(hidden_states, position_embeddings, past_key_values)
+        return self._attend(q, full_kv, attention_mask, position_embeddings, **kwargs)
+
+    def _qkv_and_window_kv(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        past_key_values: Cache | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project Q + (shared) KV, apply partial RoPE (rope is the first
+        ``rope_head_dim`` of each head), push the window K=V through the standard
+        cache update. Returns ``(q, q_residual, full_kv)``. ``q_residual`` is the
+        post-norm latent ``c_t^Q`` shared with CSA's indexer.
+        """
         batch, seq_len = hidden_states.shape[:2]
         cos, sin = position_embeddings
 
-        # --- Q + KV projections ---
         q_residual = self.q_norm(self.wq_a(hidden_states))
         q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         kv = self.kv_norm(self.wkv(hidden_states)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
 
-        # --- Standard partial RoPE: rope is the FIRST ``rope_head_dim`` of each head ---
         q_rope, q_nope = q[..., : self.rope_head_dim], q[..., self.rope_head_dim :]
         kv_rope, kv_nope = kv[..., : self.rope_head_dim], kv[..., self.rope_head_dim :]
         q_rope, kv_rope = apply_rotary_pos_emb(q_rope, kv_rope, cos, sin)
         q = torch.cat([q_rope, q_nope], dim=-1)
         kv = torch.cat([kv_rope, kv_nope], dim=-1)
 
-        # --- Window K/V (single tensor) goes through the standard cache update ---
         if past_key_values is not None:
             kv, _ = past_key_values.update(kv, kv, self.layer_idx)
-        full_kv = kv
+        return q, q_residual, kv
 
-        # --- Optional compressor-pool segment (CSA / HCA only) ---
-        pooled = self._compressor_pool(hidden_states, q_residual, position_ids, past_key_values)
-        if pooled is not None:
-            full_kv = torch.cat([full_kv, pooled], dim=2)
+    def _attend(
+        self,
+        q: torch.Tensor,
+        full_kv: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the core MQA + sink, the inverse-RoPE de-rotation of the output's rope
+        slice (paper §2.3.3, "Partial Rotary Positional Embedding"), and the grouped
+        output projection. Shared by :class:`DeepseekV4Attention`, :class:`DeepseekV4HCA`
+        and :class:`DeepseekV4CSA`.
+        """
+        batch, _, seq_len, _ = q.shape
+        cos, sin = position_embeddings
 
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
             attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
@@ -623,40 +628,10 @@ class DeepseekV4Attention(nn.Module):
         grouped = attn_output.reshape(batch, seq_len, -1).view(batch, seq_len, self.config.o_groups, -1)
         return self.wo_b(self.wo_a(grouped).flatten(2)), attn_weights
 
-    def _compressor_pool(
-        self,
-        hidden_states: torch.Tensor,
-        q_residual: torch.Tensor,
-        position_ids: torch.Tensor,
-        past_key_values: Cache | None,
-    ) -> torch.Tensor | None:
-        """Return the compressed-KV segment to concatenate onto the sliding-window KV,
-        or ``None`` for full-attention layers. CSA / HCA override the cache layer
-        promotion below by setting ``_cache_layer_cls`` accordingly.
-        """
-        if self.compressor is None:
-            return None
-        if past_key_values is not None:
-            cache_layer = past_key_values.layers[self.layer_idx]
-            # Generation builds a plain ``DynamicCache`` whose layers don't carry V4
-            # compressor state; promote in-place so the state persists across decode
-            # steps. K/V already accumulated on the prior layer is carried over.
-            if not isinstance(cache_layer, self._cache_layer_cls):
-                new_layer = self._cache_layer_cls(self.sliding_window, self._compress_rate)
-                if getattr(cache_layer, "is_initialized", False):
-                    new_layer.lazy_initialization(cache_layer.keys, cache_layer.values)
-                    new_layer.cumulative_length = getattr(cache_layer, "cumulative_length", cache_layer.keys.shape[-2])
-                past_key_values.layers[self.layer_idx] = new_layer
-                cache_layer = new_layer
-        else:
-            # Gradient-checkpointing recompute: forward-scoped scratch layer.
-            cache_layer = self._cache_layer_cls(self.sliding_window, self._compress_rate)
-        return self.compressor(hidden_states, q_residual, position_ids, cache_layer)
-
 
 class DeepseekV4HCA(DeepseekV4Attention):
-    """**Heavily Compressed Attention** (HCA, paper §2.3.2). Each query attends to
-    the sliding-window KV branch *plus* a long-range compressed branch:
+    """**Heavily Compressed Attention** (HCA, paper §2.3.2). Same shared core as
+    :class:`DeepseekV4Attention` plus a long-range compressor branch:
 
       * The compressor consolidates every ``compress_rate_hca`` (m'=128 in
         V4-Flash/Pro) consecutive KV tokens into one entry by softmax-pooling over
@@ -664,18 +639,49 @@ class DeepseekV4HCA(DeepseekV4Attention):
         Compression is *disjoint* — no overlap between adjacent windows — and reduces
         the sequence length by 1/m'.
       * The whole running compressed pool is appended to the keys / values; HCA does
-        no sparse selection.
-
-    Sharing the QKV projections, attention sink, partial RoPE and grouped output
-    projection with :class:`DeepseekV4Attention`.
+        no sparse selection (no Lightning Indexer).
     """
 
     _cache_layer_cls = DeepseekV4HCALayer
 
     def __init__(self, config: DeepseekV4Config, layer_idx: int):
         super().__init__(config, layer_idx)
-        self._compress_rate = config.compress_rate_hca
-        self.compressor = DeepseekV4Compressor(config, self._compress_rate, with_indexer=False)
+        self.compress_rate = config.compress_rate_hca
+        self.compressor = DeepseekV4Compressor(config, self.compress_rate)
+
+    def _get_or_promote_cache_layer(self, past_key_values: Cache | None):
+        """Return the matching V4 cache layer from ``past_key_values``, promoting a
+        plain ``DynamicCache`` layer in place so compressor state persists across
+        decode steps. Falls back to a forward-scoped scratch layer when
+        ``past_key_values is None`` (e.g. gradient-checkpointing recompute).
+        """
+        if past_key_values is None:
+            return self._cache_layer_cls(self.sliding_window, self.compress_rate)
+        cache_layer = past_key_values.layers[self.layer_idx]
+        if not isinstance(cache_layer, self._cache_layer_cls):
+            new_layer = self._cache_layer_cls(self.sliding_window, self.compress_rate)
+            if getattr(cache_layer, "is_initialized", False):
+                new_layer.lazy_initialization(cache_layer.keys, cache_layer.values)
+                new_layer.cumulative_length = getattr(cache_layer, "cumulative_length", cache_layer.keys.shape[-2])
+            past_key_values.layers[self.layer_idx] = new_layer
+            cache_layer = new_layer
+        return cache_layer
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        q, _, window_kv = self._qkv_and_window_kv(hidden_states, position_embeddings, past_key_values)
+        # HCA: full running compressed pool, no indexer involvement.
+        cache_layer = self._get_or_promote_cache_layer(past_key_values)
+        pooled = self.compressor(hidden_states, cache_layer)
+        full_kv = torch.cat([window_kv, pooled], dim=2)
+        return self._attend(q, full_kv, attention_mask, position_embeddings, **kwargs)
 
 
 class DeepseekV4CSA(DeepseekV4HCA):
@@ -684,29 +690,47 @@ class DeepseekV4CSA(DeepseekV4HCA):
 
       * The compressor runs at ``compress_rate_csa`` (m=4 in V4-Flash/Pro) and pools
         each window of m KV tokens into one compressed entry (paper §2.3.1, eqs.
-        9–12). Adjacent compressed entries draw from overlapping window pairs, so
-        each compressed entry is derived from 2m source tokens while the sequence
-        length is still reduced by 1/m.
-      * The Lightning Indexer (``compressor.indexer``, paper §2.3.1, eqs. 13–17) is
-        a cheap small-head scorer that runs the same compression at
-        ``index_head_dim``, then for each query computes
+        9–12).
+      * The Lightning Indexer (``self.indexer``, paper §2.3.1, eqs. 13–17) is a
+        cheap small-head scorer that runs the same compression at ``index_head_dim``,
+        then for each query computes
         ``∑_h w_{t,h} · ReLU(q_{t,h} · K^IComp_s)`` and keeps the top
         ``index_topk`` compressed entries — these are the only long-range KV
         positions that enter the core attention.
       * The latent query vector ``c_t^Q`` (output of ``q_norm(wq_a(h_t))``) is shared
         between the indexer's queries (low-rank ``wq_b`` + ``weights_proj``) and the
         main attention queries — saving redundant projections.
-
-    Inherits the rest of the block (sink, partial RoPE, grouped output, sliding
-    window branch) from :class:`DeepseekV4Attention`.
     """
 
     _cache_layer_cls = DeepseekV4CSALayer
 
     def __init__(self, config: DeepseekV4Config, layer_idx: int):
         DeepseekV4Attention.__init__(self, config, layer_idx)
-        self._compress_rate = config.compress_rate_csa
-        self.compressor = DeepseekV4Compressor(config, self._compress_rate, with_indexer=True)
+        self.compress_rate = config.compress_rate_csa
+        self.compressor = DeepseekV4Compressor(config, self.compress_rate)
+        self.indexer = DeepseekV4Indexer(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        batch, seq_len = hidden_states.shape[:2]
+        q, q_residual, window_kv = self._qkv_and_window_kv(hidden_states, position_embeddings, past_key_values)
+
+        # CSA: pool every window then sparse-select via Lightning Indexer.
+        cache_layer = self._get_or_promote_cache_layer(past_key_values)
+        pooled = self.compressor(hidden_states, cache_layer)  # [B, 1, T, head_dim]
+        topk = self.indexer(hidden_states, q_residual, position_ids, cache_layer)  # [B, S, k]
+        expanded = pooled.unsqueeze(2).expand(-1, -1, seq_len, -1, -1)
+        idx = topk.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, self.head_dim)
+        sparse_pooled = torch.gather(expanded, 3, idx).reshape(batch, 1, -1, self.head_dim)
+        full_kv = torch.cat([window_kv, sparse_pooled], dim=2)
+        return self._attend(q, full_kv, attention_mask, position_embeddings, **kwargs)
 
 
 class DeepseekV4HyperConnection(nn.Module):
