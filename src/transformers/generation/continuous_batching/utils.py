@@ -168,7 +168,7 @@ def build_attention_mask(
         attention_mask[..., query_range, key_range] = masked
 
 
-def make_up_future_states(
+def create_warmup_future_states(
     num: int,
     status: RequestStatus,
     num_q_tokens: int,

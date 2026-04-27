@@ -252,7 +252,7 @@ class ContinuousBatchProcessor:
         # First, set max blocks per request to 32 if it needs to be auto-inferred
         user_requested = self.cb_config.max_blocks_per_request is not None
         if not user_requested:
-            self.cache.max_blocks_per_request = 32
+            self.cache.max_blocks_per_request = self.cb_config._fallback_max_blocks_per_request
 
         # Then, if the decode fast path is not turned off, check if it is available
         if self.cache.max_blocks_per_request != 0:

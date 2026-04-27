@@ -25,7 +25,7 @@ from .cache import PagedAttentionCache
 from .cb_logits_processors import ContinuousBatchingLogitsProcessorList
 from .input_outputs import ContinuousBatchingAsyncIOs, ContinuousBatchingIOs
 from .requests import RequestStatus, logger
-from .utils import make_up_future_states, pad_to_interval, pad_to_pow2
+from .utils import create_warmup_future_states, pad_to_interval, pad_to_pow2
 
 
 class ModelRunner:
@@ -48,7 +48,7 @@ class ModelRunner:
         # Helper attributes
         self.do_sample = do_sample
         self.return_logprobs = return_logprobs
-        self.use_cuda_graph_varlen, self.use_cuda_graph_decode = self.cb_config.use_cuda_graph
+        self.use_cuda_graph_varlen, self.use_cuda_graph_decode = self.cb_config.get_cuda_graph_booleans()
         self.cache = cache
 
         # Set up the graph pool. This allows all graphs to share the same memory pool, greatly saving memory.
@@ -205,11 +205,19 @@ class ModelRunner:
             output_ids[1, :tokens].copy_(logprobs.view(dtype=torch.int32))
 
     @torch.inference_mode()
-    def warmup(self, model: nn.Module) -> None:
-        """Pre-capture CUDA graphs and/or trigger compile warmup for varlen and decode paths (if available)."""
+    def warmup(self, model: nn.Module, force_warmup: bool = False) -> None:
+        """Pre-capture CUDA graphs and/or trigger compile warmup for varlen and decode paths (if available). Unless the
+        force_warmup flag is set, the warmup is only performed if the CUDA graphs or compile are enabled."""
+        # Early return if the warmup is not needed
+        cuda_graph_off = not (self.use_cuda_graph_varlen or self.use_cuda_graph_decode)
+        compile_off = self.cb_config.varlen_compile_config is None or self.cb_config.decode_compile_config is None
+        if cuda_graph_off and compile_off and not force_warmup:
+            return None
+
         # In async mode, each IO pair has its own graph buffer and static tensors, so we warm up both
         total_duration = 0
-        for _ in range(1 + int(self.cb_config.use_async_batching)):
+        iterations = 2 if isinstance(self.inputs_and_outputs, ContinuousBatchingAsyncIOs) else 1
+        for _ in range(iterations):
             # Warm up the varlen path, with the largest possible dimensions to get the biggest pool and avoid fragmentation
             num_q_tokens = self.cache.max_batch_tokens
             max_kv_read = self.cache.num_blocks * self.cache.block_size
@@ -230,7 +238,7 @@ class ModelRunner:
 
             # Switch to the other IO pair if this is async
             if isinstance(self.inputs_and_outputs, ContinuousBatchingAsyncIOs):
-                self.inputs_and_outputs.current_pair = (self.inputs_and_outputs.current_pair + 1) % 2
+                self.inputs_and_outputs.swap_io_pairs()
         logger.info(f"Warmup completed in {total_duration:.2f}s")
 
     def run_one_warmup(self, model: nn.Module, num_q_tokens: int, max_kv_read: int | None) -> float:
@@ -249,7 +257,7 @@ class ModelRunner:
             num_requests = 1
             status = RequestStatus.PREFILLING
             logger.debug(f"Warming up varlen path for {num_q_tokens =}, {max_kv_read =}.")
-        future_states = make_up_future_states(num_requests, status, num_q_tokens, max_kv_read, self.cache)
+        future_states = create_warmup_future_states(num_requests, status, num_q_tokens, max_kv_read, self.cache)
         if not future_states:
             logger.warning(
                 f"Failed to warm up: no blocks allocated for {num_requests =}, {num_q_tokens =}, {max_kv_read =}."

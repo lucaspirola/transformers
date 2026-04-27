@@ -1677,6 +1677,8 @@ class ContinuousBatchingConfig:
     # This is only used in the flash_attn_with_kvcache fast decode path to dimension the block table. If it is set to 0,
     # the fast decode path will not be used. Currently turned off by default.
     max_blocks_per_request: int | None = 0
+    # If no user-hint is given and decode path is available, this is the default max blocks per request.
+    _fallback_max_blocks_per_request: int = 32
 
     # Block sharing can only be allowed, but never forced: some model just do not support it. If you only have a few
     # short prompts, but long generation lengths, you might want to disable block sharing.
@@ -1912,6 +1914,8 @@ class ContinuousBatchingConfig:
         max_generated_length = workload_hints.get("max_generated_length", 0)
         # The max number of block per request is an even number large enough to hold the max request length
         if max_prompt_length and max_generated_length:
-            max_sequence_length = max_prompt_length + max_generated_length
-            blocks_per_request = int(ceil(max_sequence_length / self.block_size)) + 1
-            self.max_blocks_per_request = blocks_per_request + (blocks_per_request % 2)
+            # We only overwrite the max blocks per request if it is not set yet
+            if self.max_blocks_per_request is None:
+                max_sequence_length = max_prompt_length + max_generated_length
+                blocks_per_request = int(ceil(max_sequence_length / self.block_size)) + 1
+                self.max_blocks_per_request = blocks_per_request + (blocks_per_request % 2)
