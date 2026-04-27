@@ -175,7 +175,7 @@ def make_up_future_states(
     max_kv_read: int,
     cache: Any,  # not annotated to avoid circular import
 ) -> list[FutureRequestState]:
-    """An utility function to create a list of FutureRequestStates for the warmup of CB."""
+    """A utility function to create a list of FutureRequestStates for the warmup of CB."""
     # Setup
     request_ids = [f"__warmup_{status.name}_{i}__" for i in range(num)]
     total_tokens = num_q_tokens + max_kv_read

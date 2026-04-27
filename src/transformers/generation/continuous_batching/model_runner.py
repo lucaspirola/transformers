@@ -16,7 +16,6 @@
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
-from typing import Any
 
 import torch
 from torch import nn
@@ -75,8 +74,8 @@ class ModelRunner:
             )
 
     def maybe_pad_inputs(self, num_q_tokens: int, max_kv_read: int, use_decode_fast_path: bool) -> tuple[int, int]:
-        """Pads the inputs sizes for the next batch if it is needed. Often it is, for max performance."""
-        max_batch_tokens = self.cb_config.max_batch_tokens
+        """Pads the input sizes for the next batch if it is needed. Often it is, for max performance."""
+        max_batch_tokens = self.cache.max_batch_tokens
         # For varlen batches, we pad using interval sizes
         if not use_decode_fast_path:
             num_q_tokens = pad_to_interval(num_q_tokens, self.cb_config.q_padding_interval_size, max_batch_tokens)
@@ -88,9 +87,9 @@ class ModelRunner:
         return num_q_tokens, max_kv_read
 
     def compute_batch(self, model: nn.Module, batch_data: dict) -> None:
-        """Main method for this class. This runs the forward pass, processes the logits and samples the next tokens. It
-        also handles which version of the forward pass to use (varlen or decode), whether to use CUDA graphs (with the
-        eventual capture of the graph) and torch compile."""
+        """Runs the forward pass, processes the logits and samples the next tokens. It also handles which version of
+        the forward pass to use (varlen or decode), whether to use CUDA graphs (with the eventual capture of the graph)
+        and torch compile."""
         # These tensors are device-resident, this is just pointer retrieval
         carry_over_ids, prev_output_ids, output_ids = self.inputs_and_outputs.get_cb_kwargs()
         # This is the stream on which the compute happens
@@ -99,13 +98,13 @@ class ModelRunner:
         # Get the appropriate forward function (compiled or not, based on current path)
         forward_fn, use_cuda_graph = self._get_forward_fn(use_block_table=self.inputs_and_outputs.use_block_table)
 
-        # If we are not using cuda graphs, we perform the generation step and return
+        # If we are not using CUDA graphs, we perform the generation step and return
         if not use_cuda_graph:
             maybe_stream = torch.cuda.stream(compute_stream) if compute_stream is not None else nullcontext()
             with maybe_stream:
                 forward_fn(model, batch_data, carry_over_ids, prev_output_ids, output_ids)
 
-        # Otherwise, we use create or replay the graph (cuda is available in this path)
+        # Otherwise, we either create or replay the graph (CUDA is available in this path)
         else:
             graph = self.inputs_and_outputs.get_graph()
             # Case: the graph already exists, so we replay it
@@ -118,7 +117,7 @@ class ModelRunner:
                 self._capture_graph(forward_fn, compute_stream, *args)
 
     def _get_forward_fn(self, use_block_table: bool) -> tuple[Callable, bool]:
-        """Helper function to get the appropriate forward function based on the block table."""
+        """Helper function to get the appropriate forward function based on the block table and compile behavior."""
         if use_block_table:
             forward_fn = self._forward_process_and_sample if self._compiled_decode is None else self._compiled_decode
             use_cuda_graph = self.use_cuda_graph_decode
@@ -127,7 +126,7 @@ class ModelRunner:
             use_cuda_graph = self.use_cuda_graph_varlen
         return forward_fn, use_cuda_graph
 
-    def _capture_graph(self, forward_fn: Any, compute_stream: torch.cuda.Stream, *args) -> None:
+    def _capture_graph(self, forward_fn: Callable, compute_stream: torch.cuda.Stream, *args) -> None:
         """Helper function to capture and store a graph for a given forward function."""
         # Warmup (ensures the right result is computed before capturing the graph)
         with torch.cuda.stream(compute_stream):
@@ -147,8 +146,8 @@ class ModelRunner:
         prev_output_ids: torch.Tensor,
         output_ids: torch.Tensor,
     ) -> None:
-        """This function performs the forward pass, logits processing, and sampling. This is what is either capture and
-        or compiled."""
+        """This function performs the forward pass, logits processing, and sampling. This is what is either captured
+        and/or compiled."""
         # Perform carry-over (no-op for synchronous batching)
         self.inputs_and_outputs.carry_over_tokens(batch_data["input_ids"], carry_over_ids, prev_output_ids)
 
@@ -168,7 +167,7 @@ class ModelRunner:
         else:
             scores = logits
 
-        # Sample next tokens (can be greedy)
+        # Sample next tokens
         self._sample(scores, batch_data["logits_indices"], output_ids)
 
     def _sample(self, scores: torch.Tensor, logits_indices: torch.Tensor, output_ids: torch.Tensor) -> None:
@@ -209,8 +208,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def warmup(self, model: nn.Module) -> None:
-        """Pre-capture CUDA graphs and / or trigger compile warmup for varlen and decode paths (if available)."""
-
+        """Pre-capture CUDA graphs and/or trigger compile warmup for varlen and decode paths (if available)."""
         # In async mode, each IO pair has its own graph buffer and static tensors, so we warm up both
         total_duration = 0
         for _ in range(1 + int(self.cb_config.use_async_batching)):
@@ -236,6 +234,7 @@ class ModelRunner:
             # Switch to the other IO pair if this is async
             if isinstance(self.inputs_and_outputs, ContinuousBatchingAsyncIOs):
                 self.inputs_and_outputs.current_pair = (self.inputs_and_outputs.current_pair + 1) % 2
+        logger.info(f"Warmup completed in {total_duration:.2f}s")
 
     def run_one_warmup(self, model: nn.Module, num_q_tokens: int, max_kv_read: int | None) -> float:
         """Warms up the decode fast path (if max_kv_read is None) or varlen path (if max_kv_read is an int) for a
@@ -248,12 +247,17 @@ class ModelRunner:
             status = RequestStatus.DECODING
             num_q_tokens = 1
             max_kv_read = self.cache.block_size
-            logger.info(f"Warming up decode fast path for {num_requests =}.")
+            logger.debug(f"Warming up decode fast path for {num_requests =}.")
         else:
             num_requests = 1
             status = RequestStatus.PREFILLING
-            logger.info(f"Warming up varlen path for {num_q_tokens =}, {max_kv_read =}.")
+            logger.debug(f"Warming up varlen path for {num_q_tokens =}, {max_kv_read =}.")
         future_states = make_up_future_states(num_requests, status, num_q_tokens, max_kv_read, self.cache)
+        if not future_states:
+            logger.warning(
+                f"Failed to warm up: no blocks allocated for {num_requests =}, {num_q_tokens =}, {max_kv_read =}."
+            )
+            return 0.0
 
         # Pad the inputs to the appropriate size
         padded_q, padded_kv = self.maybe_pad_inputs(
@@ -282,10 +286,10 @@ class ModelRunner:
 
         # Exception handling
         except Exception as e:
-            duration = time.perf_counter() - start
-            logger.warning(f"Failed to warm up varlen path: {e}. Graph pool may fragment and OOM under load.")
+            duration = 0.0
+            logger.warning(f"Failed to warm up: {e}.\nGraph pool may fragment and OOM under load.")
 
-        # In any case, free the blocks allocated for the fake warmup request
+        # In any case, free the blocks allocated for the fake warmup requests
         finally:
             for fs in future_states:
                 self.cache.free_blocks(fs.state.request_id)

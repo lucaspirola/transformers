@@ -181,8 +181,6 @@ class ContinuousBatchProcessor:
         # Retrieve the size of the sliding window if there is one
         self.sliding_window = 1 if getattr(config, "sliding_window", None) is None else config.sliding_window
         # Cuda graphs for the generation step
-        self.q_padding_interval_size = self.cb_config.q_padding_interval_size
-        self.kv_padding_interval_size = self.cb_config.kv_padding_interval_size
         self.use_cuda_graph_varlen, self.use_cuda_graph_decode = self.cb_config.get_cuda_graph_booleans()
 
         # Set up metrics collector
@@ -270,7 +268,7 @@ class ContinuousBatchProcessor:
                 if not all(conditions) and user_requested:
                     logger.warning(
                         f"Although {self.cache.max_blocks_per_request = }, the decode fast path is not available "
-                        f"because the one condition is not met: {conditions}."
+                        f"because at least one condition is not met: {conditions}."
                     )
                     self.cache.max_blocks_per_request = 0
             # Same, throw a warning only if the decode fast path was requested by the user
@@ -340,7 +338,7 @@ class ContinuousBatchProcessor:
             f"Soft resetting request {request_id} with {len(state.initial_tokens)} initial tokens and "
             f"{len(state.generated_tokens)} generated tokens"
         )
-        # Create a copy of the offloaded request keeping the generated tokens as addition to the initial prompt
+        # Create a copy of the offloaded request, keeping the generated tokens as an addition to the initial prompt
         new_state = state.create_equivalent_initial_request()
         # In async mode, this ensures the request is not updated in the other batch without triggering logging
         state._status = RequestStatus.FINISHED
@@ -551,7 +549,7 @@ class ContinuousBatchingManager:
         self.model = model.eval()
         self.generation_config = generation_config
         self.continuous_batching_config = continuous_batching_config
-        self.warmed_up = False  # Set to True after warmup is completed. Usefull for persistent managers.
+        self.warmed_up = False  # Set to True after warmup is completed. Useful for persistent managers.
         # This is an approximation until the cache is created: it will infer the correct value in cache.__init__
         self._use_prefix_sharing = self.continuous_batching_config.allow_block_sharing
 
