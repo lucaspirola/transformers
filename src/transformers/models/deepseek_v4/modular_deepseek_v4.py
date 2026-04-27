@@ -132,6 +132,7 @@ class DeepseekV4Config(DeepseekV3Config):
     attention_dropout: float = 0.0
 
     def __post_init__(self, **kwargs):
+        PreTrainedConfig.__post_init__(self, **kwargs)
         n = self.num_hidden_layers
         if self.compress_ratios is None:
             self.compress_ratios = [0] + [4 if i % 2 else 128 for i in range(max(n - 2, 0))] + ([0] if n >= 2 else [])
@@ -144,8 +145,6 @@ class DeepseekV4Config(DeepseekV3Config):
         self.qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if self.partial_rotary_factor is None:
             self.partial_rotary_factor = self.qk_rope_head_dim / self.head_dim
-        # Skip ``DeepseekV3Config.__post_init__`` (it would pin head_dim to qk_rope_head_dim).
-        PreTrainedConfig.__post_init__(self, **kwargs)
         self.compress_rope_parameters = {**self.rope_parameters, "rope_theta": self.compress_rope_theta}
 
 
@@ -280,15 +279,7 @@ class DeepseekV4CompressorIndexerLayer(DeepseekV4CompressorLayer):
             return new_pooled.new_zeros((new_pooled.shape[0], 0, new_pooled.shape[-1]))
         return self.indexer_pool
 
-
-def _make_layer(config: DeepseekV4Config, compress_ratio: int):
-    """Pick the cache-layer class implied by ``compress_ratio``."""
-    if compress_ratio == 4:
-        return DeepseekV4CompressorIndexerLayer(config.sliding_window, compress_ratio)
-    if compress_ratio == 128:
-        return DeepseekV4CompressorLayer(config.sliding_window, compress_ratio)
-    return DeepseekV4SlidingLayer(config.sliding_window)
-
+RATIO_TO_LAYER_CLS = {0: DeepseekV4SlidingLayer, 4: DeepseekV4CompressorIndexerLayer, 128: DeepseekV4CompressorLayer}
 
 class DeepseekV4Cache(DynamicCache):
     """One cache layer per ``config.compress_ratios[i]`` — sliding-only, compressor,
@@ -298,13 +289,7 @@ class DeepseekV4Cache(DynamicCache):
 
     def __init__(self, config: DeepseekV4Config | None = None):
         super().__init__(config=config)
-        if config is not None:
-            self.layers = [_make_layer(config, ratio) for ratio in config.compress_ratios]
-
-
-# -----------------------------------------------------------------------------
-# Output projection (block-diagonal grouped low-rank).
-# -----------------------------------------------------------------------------
+        self.layers = [RATIO_TO_LAYER_CLS[ratio] for ratio in config.compress_ratios]
 
 
 class DeepseekV4GroupedLinear(nn.Linear):
@@ -326,11 +311,6 @@ class DeepseekV4GroupedLinear(nn.Linear):
         x = x.reshape(-1, self.n_groups, d_in).permute(1, 0, 2)
         y = torch.bmm(x, w.transpose(-1, -2)).permute(1, 0, 2)
         return y.reshape(*batch_shape, self.n_groups, out_per_group)
-
-
-# -----------------------------------------------------------------------------
-# Indexer (owned by Compressor when compress_ratio == 4).
-# -----------------------------------------------------------------------------
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -641,13 +621,14 @@ class DeepseekV4Attention(DeepseekV3Attention):
         return self.wo_b(self.wo_a(grouped).flatten(2)), attn_weights
 
 
-# -----------------------------------------------------------------------------
-# Hyper-Connection.
-# -----------------------------------------------------------------------------
-
 
 class DeepseekV4HyperConnection(nn.Module):
-    r"""Per-site Hyper-Connection mixer. Owns the learned (``fn``, ``base``, ``scale``)
+    r"""
+    Manifold-Constrained Hyper-Connections
+    (mHC) (Xie et al., 2026) to strengthen the conventional residual connections between adjacent
+    Transformer blocks
+
+    Owns the learned (``fn``, ``base``, ``scale``)
     parameters that turn the incoming ``hc_mult`` residual streams into collapse / expand
     weights. The decoder layer instantiates two of these (one for the attention site,
     one for the mlp site).
