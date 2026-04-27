@@ -205,13 +205,13 @@ class ModelRunner:
             output_ids[1, :tokens].copy_(logprobs.view(dtype=torch.int32))
 
     @torch.inference_mode()
-    def warmup(self, model: nn.Module, force_warmup: bool = False) -> None:
+    def warmup(self, model: nn.Module) -> None:
         """Pre-capture CUDA graphs and/or trigger compile warmup for varlen and decode paths (if available). Unless the
         force_warmup flag is set, the warmup is only performed if the CUDA graphs or compile are enabled."""
         # Early return if the warmup is not needed
         cuda_graph_off = not (self.use_cuda_graph_varlen or self.use_cuda_graph_decode)
         compile_off = self.cb_config.varlen_compile_config is None or self.cb_config.decode_compile_config is None
-        if cuda_graph_off and compile_off and not force_warmup:
+        if cuda_graph_off and compile_off:
             return None
 
         # In async mode, each IO pair has its own graph buffer and static tensors, so we warm up both
