@@ -19,7 +19,7 @@ if is_torch_available():
     from transformers import DeepseekV4Config, DeepseekV4ForCausalLM, DeepseekV4Model
     from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4Cache,
-        DeepseekV4Compressor,
+        DeepseekV4HCACompressor,
     )
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
@@ -54,7 +54,7 @@ class DeepseekV4ModelTester(CausalLMModelTester):
         # ``CausalLMModelTest`` can exercise the model without running into the hash
         # router's ``input_ids`` requirement. A dedicated test covers the hash path.
         self.num_hash_layers = 0
-        self.layer_types = ["sliding_attention", "compressed_sparse_attention"]
+        self.layer_types = ["heavily_compressed_attention", "compressed_sparse_attention"]
         self.sliding_window = 8
         self.hc_mult = 2
         self.hc_sinkhorn_iters = 3
@@ -193,7 +193,7 @@ def _tiny_config(**overrides):
         "num_attention_heads": 4,
         "num_key_value_heads": 1,
         "num_hidden_layers": 2,
-        "layer_types": ["sliding_attention", "compressed_sparse_attention"],
+        "layer_types": ["heavily_compressed_attention", "compressed_sparse_attention"],
         "sliding_window": 4,
         "hc_mult": 2,
         "hc_sinkhorn_iters": 3,
@@ -232,19 +232,19 @@ class DeepseekV4ParityTest(unittest.TestCase):
 
     def test_compressor_pool_matches_reference(self):
         """Re-implement the reference ``Compressor._pool`` (softmax-gated sum-pool with
-        a learned absolute position embedding) and check it matches what the V4
-        :class:`DeepseekV4HCALayer` + :class:`DeepseekV4Compressor` produce inline.
+        a learned ``position_bias``) and check it matches what the V4
+        :class:`DeepseekV4HCALayer` + :class:`DeepseekV4HCACompressor` produce inline.
         """
         torch.manual_seed(0)
         batch, length, head_dim, rate = 2, 8, 16, 4
         kv = torch.randn(batch, length, head_dim)
         gate = torch.randn(batch, length, head_dim)
-        window_pos_bias = torch.randn(rate, head_dim)
+        position_bias = torch.randn(rate, head_dim)
 
-        # Reproduce the V4 in-line pool from ``DeepseekV4Compressor.forward``.
+        # Reproduce the V4 in-line pool from ``DeepseekV4HCACompressor._pool``.
         n_windows = length // rate
         view_kv = kv.view(batch, n_windows, rate, head_dim)
-        view_gate = gate.view(batch, n_windows, rate, head_dim) + window_pos_bias.to(gate.dtype)
+        view_gate = gate.view(batch, n_windows, rate, head_dim) + position_bias.to(gate.dtype)
         ours = (view_kv * view_gate.softmax(dim=2)).sum(dim=2)
 
         # Reference (transcribed from upstream ``inference/model.py``).
@@ -252,39 +252,41 @@ class DeepseekV4ParityTest(unittest.TestCase):
         for b in range(batch):
             for i in range(n_windows):
                 window_kv = kv[b, i * rate : (i + 1) * rate]
-                window_gate = gate[b, i * rate : (i + 1) * rate] + window_pos_bias
+                window_gate = gate[b, i * rate : (i + 1) * rate] + position_bias
                 w = torch.softmax(window_gate, dim=0)
                 reference[b, i] = (window_kv * w).sum(dim=0)
 
         torch.testing.assert_close(ours, reference, rtol=1e-5, atol=1e-6)
 
     def test_compressor_cache_accumulates_across_calls(self):
-        """Feeding the compressor one token at a time must produce the same pool as
-        feeding the whole sequence. Using an HCA-only schedule keeps the test
-        indexer-free so we don't have to thread ``position_ids`` for that branch.
+        """Feeding the HCA compressor one token at a time must produce the same pool
+        as feeding the whole sequence. Using HCA keeps the test indexer-free.
         """
         torch.manual_seed(1)
         config = _tiny_config(
-            layer_types=["sliding_attention", "heavily_compressed_attention"],
+            layer_types=["heavily_compressed_attention", "heavily_compressed_attention"],
             sliding_window=128,
             max_position_embeddings=512,
             compress_rate_hca=128,
         )
-        compressor = DeepseekV4Compressor(config, compress_rate=128).eval()
-        # Initialise ``window_pos_bias`` to non-zero so the test exercises the pooling math.
-        torch.nn.init.normal_(compressor.window_pos_bias, std=0.1)
+        compressor = DeepseekV4HCACompressor(config, compress_rate=128).eval()
+        # Initialise ``position_bias`` to non-zero so the test exercises the pooling math.
+        torch.nn.init.normal_(compressor.position_bias, std=0.1)
 
         batch, seq_len = 1, 256  # two full windows
         hidden_states = torch.randn(batch, seq_len, config.hidden_size)
+        position_ids = torch.arange(seq_len).unsqueeze(0)
 
         cache_full = DeepseekV4Cache(config=config)
         with torch.no_grad():
-            one_shot = compressor(hidden_states, cache_full.layers[1])
+            one_shot = compressor(hidden_states, None, position_ids, cache_full.layers[1])
 
         cache_inc = DeepseekV4Cache(config=config)
         with torch.no_grad():
             for step in range(seq_len):
-                incremental = compressor(hidden_states[:, step : step + 1], cache_inc.layers[1])
+                incremental = compressor(
+                    hidden_states[:, step : step + 1], None, torch.tensor([[step]]), cache_inc.layers[1]
+                )
         self.assertEqual(one_shot.shape, incremental.shape)
         torch.testing.assert_close(one_shot, incremental, rtol=1e-4, atol=1e-5)
 

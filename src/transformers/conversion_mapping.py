@@ -119,15 +119,15 @@ def _build_checkpoint_conversion_mapping():
             ),
             WeightRenaming(
                 source_patterns=r"^layers\.(\d+)\.attn\.indexer\.compressor\.norm\.",
-                target_patterns=r"model.layers.\1.self_attn.indexer.kv_norm.",
+                target_patterns=r"model.layers.\1.self_attn.compressor.indexer.kv_norm.",
             ),
             WeightRenaming(
                 source_patterns=r"^layers\.(\d+)\.attn\.indexer\.compressor\.",
-                target_patterns=r"model.layers.\1.self_attn.indexer.",
+                target_patterns=r"model.layers.\1.self_attn.compressor.indexer.",
             ),
             WeightRenaming(
                 source_patterns=r"^layers\.(\d+)\.attn\.indexer\.",
-                target_patterns=r"model.layers.\1.self_attn.indexer.",
+                target_patterns=r"model.layers.\1.self_attn.compressor.indexer.",
             ),
             WeightRenaming(
                 source_patterns=r"^layers\.(\d+)\.attn\.compressor\.norm\.",

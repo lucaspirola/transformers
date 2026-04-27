@@ -1353,12 +1353,7 @@ class StaticCache(Cache):
 
         layers = []
         for layer_type in layer_types:
-            if layer_type == "sliding_attention":
-                layer = StaticSlidingWindowLayer(max_cache_len=max_cache_len, sliding_window=config.sliding_window)
-            elif layer_type in ("compressed_sparse_attention", "heavily_compressed_attention"):
-                # V4's CSA / HCA blocks both have a sliding-window KV branch that goes
-                # through the standard cache; the long-range compressed segment lives
-                # on a separate per-layer state managed by the V4 dynamic cache.
+            if layer_type in ("sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention"):
                 layer = StaticSlidingWindowLayer(max_cache_len=max_cache_len, sliding_window=config.sliding_window)
             elif layer_type == "chunked_attention":
                 # From a cache point of view, both sliding and chunked are the same in how they should behave and how many

@@ -19,7 +19,6 @@ from ...utils import auto_docstring
 
 
 DEEPSEEK_V4_LAYER_TYPES = (
-    "sliding_attention",
     "compressed_sparse_attention",
     "heavily_compressed_attention",
 )
@@ -150,12 +149,12 @@ class DeepseekV4Config(PreTrainedConfig):
         super().__post_init__(**kwargs)
         n = self.num_hidden_layers
         if self.layer_types is None:
-            # V4-Flash default: two full-attention bootstrap layers, then CSA / HCA interleaved.
+            # V4-Pro default: two HCA bootstrap layers, then CSA / HCA interleaved.
             interleave = [
                 "compressed_sparse_attention" if i % 2 else "heavily_compressed_attention"
                 for i in range(max(n - 2, 0))
             ]
-            head = ["sliding_attention"] * min(n, 2)
+            head = ["heavily_compressed_attention"] * min(n, 2)
             self.layer_types = head + interleave
         self.layer_types = list(self.layer_types[:n])
         if len(self.layer_types) != n:
