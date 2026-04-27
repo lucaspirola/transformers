@@ -34,7 +34,6 @@ class DeepseekV4Config(PreTrainedConfig):
     index_n_heads, index_head_dim, index_topk (`int`): Indexer hyperparameters.
     hc_sinkhorn_iters (`int`), hc_eps (`float`): Sinkhorn normalisation knobs.
     num_nextn_predict_layers (`int`): MTP layer count in the upstream checkpoint (not instantiated here).
-    compress_rope_parameters (`dict`, *optional*): Filled in ``__post_init__``.
     """
 
     model_type = "deepseek_v4"
@@ -103,7 +102,6 @@ class DeepseekV4Config(PreTrainedConfig):
 
     compress_ratios: list[int] | None = None
     compress_rope_theta: float = 160000.0
-    compress_rope_parameters: dict | None = None
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1.0e-6
@@ -137,7 +135,18 @@ class DeepseekV4Config(PreTrainedConfig):
             self.partial_rotary_factor = self.qk_rope_head_dim / self.head_dim
         # Skip ``DeepseekV3Config.__post_init__`` (it would pin head_dim to qk_rope_head_dim).
         super().__post_init__(**kwargs)
-        self.compress_rope_parameters = {**self.rope_parameters, "rope_theta": self.compress_rope_theta}
+        # Normalize rope_parameters into a per-layer-type dict ``{"main": {...}, "compress": {...}}``
+        # (Gemma3 pattern). Idempotent across save/load: round-tripping preserves structure.
+        rp = self.rope_parameters or {}
+        if isinstance(rp.get("main"), dict) and isinstance(rp.get("compress"), dict):
+            self.rope_parameters = {"main": rp["main"], "compress": rp["compress"]}
+        else:
+            main = {k: v for k, v in rp.items() if k not in ("main", "compress")}
+            main.setdefault("rope_type", "default")
+            main.setdefault("rope_theta", self.rope_theta)
+            main["partial_rotary_factor"] = self.partial_rotary_factor
+            compress = {**main, "rope_theta": self.compress_rope_theta}
+            self.rope_parameters = {"main": main, "compress": compress}
 
 
 __all__ = ["DeepseekV4Config"]

@@ -11,7 +11,6 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-import copy
 from collections.abc import Callable
 
 import torch
@@ -58,47 +57,41 @@ class DeepseekV4RMSNorm(nn.Module):
 
 
 class DeepseekV4RotaryEmbedding(nn.Module):
-    """Inherits V3's rotary embedding. Only difference: V4's
-    ``compute_default_rope_parameters`` honours ``partial_rotary_factor`` so cos/sin is
-    sized to ``qk_rope_head_dim`` (not the full ``head_dim=512``).
+    """Multi-layer-type rotary embedding (Gemma3 pattern). Holds two ``inv_freq``
+    buffers — ``"main"`` for self-attention (``rope_theta``) and ``"compress"`` for
+    the Compressor / Indexer (``compress_rope_theta``). Both honour
+    ``partial_rotary_factor`` so cos/sin is sized to ``qk_rope_head_dim`` rather than
+    the full ``head_dim``. ``forward(x, position_ids, layer_type=...)`` picks one.
     """
 
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
+    layer_types = ("main", "compress")
 
-    def __init__(self, config: DeepseekV4Config, device=None):
+    def __init__(self, config: "DeepseekV4Config", device=None):
         super().__init__()
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
-
         self.config = config
-
-        self.rope_type = self.config.rope_parameters["rope_type"]
-        rope_init_fn: Callable = self.compute_default_rope_parameters
-        if self.rope_type != "default":
-            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
-
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+        self.rope_type = {}
+        for layer_type in self.layer_types:
+            params = config.rope_parameters.get(layer_type)
+            if params is None:
+                continue
+            self.rope_type[layer_type] = params.get("rope_type", "default")
+            rope_init_fn: Callable = self.compute_default_rope_parameters
+            if self.rope_type[layer_type] != "default":
+                rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type[layer_type]]
+            inv_freq, scaling = rope_init_fn(config, device, layer_type=layer_type)
+            self.register_buffer(f"{layer_type}_inv_freq", inv_freq, persistent=False)
+            self.register_buffer(f"{layer_type}_original_inv_freq", inv_freq.clone(), persistent=False)
+            setattr(self, f"{layer_type}_attention_scaling", scaling)
 
     @staticmethod
-    def compute_default_rope_parameters(config, device=None, seq_len=None) -> tuple["torch.Tensor", float]:
-        """
-        Computes the inverse frequencies according to the original RoPE implementation
-        Args:
-            config ([`~transformers.PreTrainedConfig`]):
-                The model configuration.
-            device (`torch.device`):
-                The device to use for initialization of the inverse frequencies.
-            seq_len (`int`, *optional*):
-                The current sequence length. Unused for this type of RoPE.
-        Returns:
-            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
-        """
-        base = config.rope_parameters["rope_theta"]
+    def compute_default_rope_parameters(config, device=None, seq_len=None, layer_type=None):
+        params = config.rope_parameters[layer_type]
+        base = params["rope_theta"]
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
+        factor = params.get("partial_rotary_factor", 1.0)
         dim = int(head_dim * factor)
         inv_freq = 1.0 / (
             base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
@@ -106,18 +99,18 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         return inv_freq, 1.0
 
     @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-    def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+    @dynamic_rope_update
+    def forward(self, x, position_ids, layer_type="main"):
+        inv_freq = getattr(self, f"{layer_type}_inv_freq")
+        attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
+        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
-
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with maybe_autocast(device_type=device_type, enabled=False):  # Force float32
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
+            cos = emb.cos() * attention_scaling
+            sin = emb.sin() * attention_scaling
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -303,14 +296,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def _compress_rotary(config: DeepseekV4Config) -> DeepseekV4RotaryEmbedding:
-    """Build a rotary embedding configured with ``compress_rope_theta`` (used by both
-    Compressor and Indexer)."""
-    compress_config = copy.copy(config)
-    compress_config.rope_parameters = config.compress_rope_parameters
-    return DeepseekV4RotaryEmbedding(compress_config)
-
-
 # -----------------------------------------------------------------------------
 # Indexer (owned by Compressor when compress_ratio == 4).
 # -----------------------------------------------------------------------------
@@ -328,8 +313,8 @@ class DeepseekV4Indexer(nn.Module):
     query/key inner products are translation-invariant in the standard rope sense — if
     they used different thetas the score ``q · k`` would carry a residual position-
     dependent skew. We can't precompute cos/sin once at init because the query
-    positions vary per call, so the indexer just owns a rotary instance and computes
-    cos/sin twice per forward.
+    positions vary per call, so the indexer owns a rotary embedding and calls it with
+    ``layer_type="compress"`` twice per forward (once for pool keys, once for queries).
     """
 
     def __init__(self, config: DeepseekV4Config):
@@ -346,7 +331,7 @@ class DeepseekV4Indexer(nn.Module):
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
-        self.rotary = _compress_rotary(config)
+        self.rotary_emb = DeepseekV4RotaryEmbedding(config)
 
     def forward(
         self,
@@ -373,7 +358,7 @@ class DeepseekV4Indexer(nn.Module):
                 .unsqueeze(0)
                 .expand(batch, -1)
             )
-            cos, sin = self.rotary(new_pooled, position_ids=positions)
+            cos, sin = self.rotary_emb(new_pooled, position_ids=positions, layer_type="compress")
             pool_rope, pool_nope = new_pooled[..., : self.rope_head_dim], new_pooled[..., self.rope_head_dim :]
             pool_rope, _ = apply_rotary_pos_emb(
                 pool_rope.unsqueeze(1), torch.zeros_like(pool_rope.unsqueeze(1)), cos, sin
@@ -384,7 +369,7 @@ class DeepseekV4Indexer(nn.Module):
         pooled_kv = cache_layer.update_indexer_pool(new_pooled)
 
         # --- Query side ---
-        cos_q, sin_q = self.rotary(hidden_states, position_ids=position_ids)
+        cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type="compress")
         q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         q_rope, q_nope = q[..., : self.rope_head_dim], q[..., self.rope_head_dim :]
         q_rope, _ = apply_rotary_pos_emb(q_rope, torch.zeros_like(q_rope), cos_q, sin_q)
@@ -420,7 +405,7 @@ class DeepseekV4Compressor(nn.Module):
         self.window_pos_bias = nn.Parameter(torch.empty(compress_ratio, head_dim))
         self.kv_norm = DeepseekV4RMSNorm(head_dim, eps=config.rms_norm_eps)
         self.indexer: DeepseekV4Indexer | None = DeepseekV4Indexer(config) if compress_ratio == 4 else None
-        self.rotary = _compress_rotary(config)
+        self.rotary_emb = DeepseekV4RotaryEmbedding(config)
 
     def forward(
         self,
@@ -447,7 +432,7 @@ class DeepseekV4Compressor(nn.Module):
                 .unsqueeze(0)
                 .expand(batch, -1)
             )
-            cos, sin = self.rotary(new_pooled, position_ids=positions)
+            cos, sin = self.rotary_emb(new_pooled, position_ids=positions, layer_type="compress")
             pool_rope, pool_nope = new_pooled[..., : self.rope_head_dim], new_pooled[..., self.rope_head_dim :]
             pool_rope, _ = apply_rotary_pos_emb(
                 pool_rope.unsqueeze(1), torch.zeros_like(pool_rope.unsqueeze(1)), cos, sin
@@ -982,6 +967,14 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
             init.ones_(module.hc_scale)
         elif isinstance(module, (DeepseekV4Compressor, DeepseekV4Indexer)):
             init.zeros_(module.window_pos_bias)
+        elif isinstance(module, DeepseekV4RotaryEmbedding):
+            for layer_type in module.layer_types:
+                rope_init_fn = module.compute_default_rope_parameters
+                if module.rope_type[layer_type] != "default":
+                    rope_init_fn = ROPE_INIT_FUNCTIONS[module.rope_type[layer_type]]
+                curr_inv_freq, _ = rope_init_fn(module.config, layer_type=layer_type)
+                init.copy_(getattr(module, f"{layer_type}_inv_freq"), curr_inv_freq)
+                init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
 @auto_docstring
@@ -994,8 +987,6 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         )
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = DeepseekV4HyperHead(config)
-        # Only the main-attention rotary lives on the model. Compressor / Indexer own
-        # their own ``compress_rope_theta`` rotary instances.
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.gradient_checkpointing = False
         self.post_init()
@@ -1037,7 +1028,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             position_ids=position_ids,
         )
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
-        cos_sin = self.rotary_emb(inputs_embeds, position_ids=position_ids)
+        cos_sin = self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main")
 
         for layer in self.layers:
             hidden_states = layer(

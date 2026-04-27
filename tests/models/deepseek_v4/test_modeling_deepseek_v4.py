@@ -7,6 +7,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 import unittest
 
+from parameterized import parameterized
+
 from transformers import is_torch_available
 from transformers.testing_utils import require_torch
 
@@ -100,6 +102,19 @@ class DeepseekV4ModelTest(CausalLMModelTest, unittest.TestCase):
                 self.assertEqual(layer_attention.shape[0], batch_size)
                 self.assertEqual(layer_attention.shape[1], config.num_attention_heads)
 
+    @unittest.skip(
+        "V4's rotary uses per-layer-type inv_freq buffers (Gemma3 pattern); the common test calls forward without `layer_type` and reads `.inv_freq`, neither of which apply."
+    )
+    def test_model_rope_scaling_frequencies(self):
+        pass
+
+    @parameterized.expand([("linear",), ("dynamic",), ("yarn",)])
+    @unittest.skip(
+        "V4's rotary uses per-layer-type rope_parameters; the common test sets a flat dict and skips for multi-layer-type rotaries."
+    )
+    def test_model_rope_scaling_from_config(self, scaling_type):
+        pass
+
     def test_hidden_states_output(self):
         # V4 layers emit a 4D ``[B, S, hc_mult, hidden]`` tensor — the hc_mult streams
         # are only collapsed at the top of the model via ``hc_head``. The common
@@ -169,40 +184,40 @@ def _tiny_config(**overrides):
     (``hc_mult=2``), hash routing (layer 0), a local-SWA layer, a compressor-with-
     indexer layer (ratio 4), and a routed MoE with a shared expert.
     """
-    defaults = dict(
-        vocab_size=32,
-        hidden_size=32,
-        head_dim=16,
-        qk_rope_head_dim=4,
-        q_lora_rank=16,
-        num_attention_heads=4,
-        num_key_value_heads=1,
-        num_hidden_layers=2,
-        compress_ratios=[0, 4],
-        sliding_window=4,
-        hc_mult=2,
-        hc_sinkhorn_iters=3,
-        hc_eps=1e-6,
-        moe_intermediate_size=32,
-        n_routed_experts=4,
-        n_shared_experts=1,
-        num_experts_per_tok=2,
-        num_hash_layers=1,
-        scoring_func="sqrtsoftplus",
-        routed_scaling_factor=1.0,
-        swiglu_limit=10.0,
-        o_groups=2,
-        o_lora_rank=8,
-        index_n_heads=2,
-        index_head_dim=8,
-        index_topk=2,
-        num_nextn_predict_layers=0,
-        max_position_embeddings=32,
-        rope_theta=10000.0,
-        compress_rope_theta=10000.0,  # match main rope for a cleaner parity check
-        attention_bias=False,
-        attention_dropout=0.0,
-    )
+    defaults = {
+        "vocab_size": 32,
+        "hidden_size": 32,
+        "head_dim": 16,
+        "qk_rope_head_dim": 4,
+        "q_lora_rank": 16,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "num_hidden_layers": 2,
+        "compress_ratios": [0, 4],
+        "sliding_window": 4,
+        "hc_mult": 2,
+        "hc_sinkhorn_iters": 3,
+        "hc_eps": 1e-6,
+        "moe_intermediate_size": 32,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 2,
+        "num_hash_layers": 1,
+        "scoring_func": "sqrtsoftplus",
+        "routed_scaling_factor": 1.0,
+        "swiglu_limit": 10.0,
+        "o_groups": 2,
+        "o_lora_rank": 8,
+        "index_n_heads": 2,
+        "index_head_dim": 8,
+        "index_topk": 2,
+        "num_nextn_predict_layers": 0,
+        "max_position_embeddings": 32,
+        "rope_theta": 10000.0,
+        "compress_rope_theta": 10000.0,  # match main rope for a cleaner parity check
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+    }
     defaults.update(overrides)
     return DeepseekV4Config(**defaults)
 

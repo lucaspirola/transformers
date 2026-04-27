@@ -910,7 +910,7 @@ class Fp8Dequantize(ConversionOps):
 
     @staticmethod
     def _is_scale_key(key: str) -> bool:
-        base = key[:-1] if key.endswith("$") else key
+        base = key.removesuffix("$")
         return base.endswith("weight_scale_inv") or base == "activation_scale"
 
     # E2M1 (FP4) value table — checkpoints sometimes ship MoE experts as packed FP4
