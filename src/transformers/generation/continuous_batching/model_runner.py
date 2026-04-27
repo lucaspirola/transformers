@@ -61,16 +61,14 @@ class ModelRunner:
         self._compiled_varlen = None
         if self.cb_config.varlen_compile_config is not None:
             self._compiled_varlen = torch.compile(
-                self._forward_process_and_sample,
-                **self.cb_config.varlen_compile_config.to_dict()
+                self._forward_process_and_sample, **self.cb_config.varlen_compile_config.to_dict()
             )
 
         # Set up compiled version of the forward pass for the decode path
         self._compiled_decode = None
         if self.cb_config.decode_compile_config is not None:
             self._compiled_decode = torch.compile(
-                self._forward_process_and_sample,
-                **self.cb_config.decode_compile_config.to_dict()
+                self._forward_process_and_sample, **self.cb_config.decode_compile_config.to_dict()
             )
 
     def maybe_pad_inputs(self, num_q_tokens: int, max_kv_read: int, use_decode_fast_path: bool) -> tuple[int, int]:
@@ -212,7 +210,6 @@ class ModelRunner:
         # In async mode, each IO pair has its own graph buffer and static tensors, so we warm up both
         total_duration = 0
         for _ in range(1 + int(self.cb_config.use_async_batching)):
-
             # Warm up the varlen path, with the largest possible dimensions to get the biggest pool and avoid fragmentation
             num_q_tokens = self.cache.max_batch_tokens
             max_kv_read = self.cache.num_blocks * self.cache.block_size
@@ -263,7 +260,7 @@ class ModelRunner:
         padded_q, padded_kv = self.maybe_pad_inputs(
             num_q_tokens=num_q_tokens * num_requests,
             max_kv_read=max_kv_read,
-            use_decode_fast_path=use_decode_fast_path
+            use_decode_fast_path=use_decode_fast_path,
         )
 
         # Actual warmup, which happens in a try-finally block to ensure the blocks are freed even if the warmup fails
