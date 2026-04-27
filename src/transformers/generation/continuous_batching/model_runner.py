@@ -216,11 +216,10 @@ class ModelRunner:
         for _ in range(1 + int(self.cb_config.use_async_batching)):
 
             # Warm up the varlen path, with the largest possible dimensions to get the biggest pool and avoid fragmentation
-            total_duration += self.run_one_warmup(
-                model=model,
-                num_q_tokens=self.cache.max_batch_tokens,
-                num_kv_tokens=self.cache.num_blocks * self.cache.block_size
-            )
+            num_q_tokens = self.cache.max_batch_tokens
+            max_kv_read = self.cache.num_blocks * self.cache.block_size
+            max_kv_read -= num_q_tokens  # make room for the new tokens
+            total_duration += self.run_one_warmup(model=model, num_q_tokens=num_q_tokens, max_kv_read=max_kv_read)
 
             # Exit here if the decode fast path is not available
             if self.cache.max_blocks_per_request == 0:
@@ -229,7 +228,7 @@ class ModelRunner:
             # Warm up the decode path
             num_requests = 1
             while True:
-                total_duration += self.run_one_warmup(model=model, num_q_tokens=num_requests, num_kv_tokens=None)
+                total_duration += self.run_one_warmup(model=model, num_q_tokens=num_requests, max_kv_read=None)
                 if num_requests >= self.cache.max_batch_tokens:
                     break
                 num_requests = min(2 * num_requests, self.cache.max_batch_tokens)
@@ -238,29 +237,28 @@ class ModelRunner:
             if isinstance(self.inputs_and_outputs, ContinuousBatchingAsyncIOs):
                 self.inputs_and_outputs.current_pair = (self.inputs_and_outputs.current_pair + 1) % 2
 
-    def run_one_warmup(self, model: nn.Module, num_q_tokens: int, num_kv_tokens: int | None) -> float:
-        """Warms up the decode fast path (if num_kv_tokens is None) or varlen path (if num_kv_tokens is an int) for a
-        specific number of query and cache tokens."""
+    def run_one_warmup(self, model: nn.Module, num_q_tokens: int, max_kv_read: int | None) -> float:
+        """Warms up the decode fast path (if max_kv_read is None) or varlen path (if max_kv_read is an int) for a
+        specific number of query and cache-resident tokens. `max_kv_read` is the number of tokens already in cache,
+        matching the terminology used by `prepare_batch_tensors` and the scheduler."""
         # Make up fake request states according to the chosen path
-        use_decode_fast_path = num_kv_tokens is None
+        use_decode_fast_path = max_kv_read is None
         if use_decode_fast_path:
             num_requests = num_q_tokens
             status = RequestStatus.DECODING
             num_q_tokens = 1
-            num_kv_tokens = self.cache.block_size
-            logger.info(f"Warming up decode fast path for {num_q_tokens =}.")
+            max_kv_read = self.cache.block_size
+            logger.info(f"Warming up decode fast path for {num_requests =}.")
         else:
             num_requests = 1
             status = RequestStatus.PREFILLING
-            num_q_tokens = num_q_tokens
-            num_kv_tokens = num_kv_tokens
-            logger.info(f"Warming up varlen path for {num_q_tokens =}, {num_kv_tokens =}.")
-        future_states = make_up_future_states(num_requests, status, num_q_tokens, num_kv_tokens, self.cache)
+            logger.info(f"Warming up varlen path for {num_q_tokens =}, {max_kv_read =}.")
+        future_states = make_up_future_states(num_requests, status, num_q_tokens, max_kv_read, self.cache)
 
         # Pad the inputs to the appropriate size
         padded_q, padded_kv = self.maybe_pad_inputs(
-            num_q_tokens=num_q_tokens,
-            max_kv_read=num_kv_tokens,
+            num_q_tokens=num_q_tokens * num_requests,
+            max_kv_read=max_kv_read,
             use_decode_fast_path=use_decode_fast_path
         )
 
