@@ -836,7 +836,7 @@ class DeepseekV4TopKRouter(MixtralTopKRouter):
 
 
 class DeepseekV4HashRouter(MixtralTopKRouter):
-    """First ``num_hash_layers`` layers route via a frozen ``tid2eid`` lookup keyed by
+    """First ``num_hash_layers`` layers route via a frozen ``tid2eid`` (token id to expert it) lookup keyed by
     the input token id. The learned gate ``weight`` still produces scoring values used
     to weight each selected expert's activation; the selection itself is static.
     """
@@ -946,7 +946,7 @@ class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
             comb.to(dtype), hidden_states
         )
 
-        # --- MLP site: same pattern ---
+        # --- MLP site: collapse → norm → attn → expand ---
         pre, post, comb = self.ffn_hc(hidden_states)
         collapsed = (pre.unsqueeze(-1) * hidden_states).sum(dim=2).to(hidden_states.dtype)
         mlp_output = self.mlp(self.post_attention_layernorm(collapsed), input_ids=kwargs.get("input_ids"))
@@ -1010,17 +1010,10 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = DeepseekV4HyperHead(config)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        compress_config = copy.copy(config)
-        compress_config.rope_parameters = config.compress_rope_parameters
-        self.rotary_emb_compress = DeepseekV4RotaryEmbedding(compress_config)
+        self.rotary_emb_compress = DeepseekV4RotaryEmbedding(config)
         self.gradient_checkpointing = False
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
 
     @merge_with_config_defaults
     @capture_outputs
@@ -1081,17 +1074,10 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
 
 
 class DeepseekV4ForCausalLM(MixtralForCausalLM):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: DeepseekV4Config):
-        PreTrainedModel.__init__(self, config)
+        super().__init__(config)
         self.model = DeepseekV4Model(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.router_aux_loss_coef = config.router_aux_loss_coef
-        self.num_experts = config.n_routed_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.post_init()
 
 
 __all__ = [
