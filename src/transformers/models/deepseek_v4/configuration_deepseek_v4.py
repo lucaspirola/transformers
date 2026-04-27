@@ -40,8 +40,6 @@ class DeepseekV4Config(PreTrainedConfig):
     model_type = "deepseek_v4"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    # V4 has no dense-MLP layers (all MoE), and the HC mixers are layer-level parameters
-    # (``hc_attn_*`` / ``hc_ffn_*``) not shardable. Otherwise the plan is V3-style.
     base_model_tp_plan = {
         "layers.*.self_attn.wq_a": "colwise",
         "layers.*.self_attn.wq_b": "colwise",
@@ -62,7 +60,6 @@ class DeepseekV4Config(PreTrainedConfig):
     }
     attribute_map = {"num_local_experts": "n_routed_experts"}
 
-    # V4 reshapes the attention: single-head KV, grouped low-rank output, no MLA decomposition.
     vocab_size: int = 129280
     hidden_size: int = 4096
     intermediate_size: int = 18432
@@ -74,8 +71,7 @@ class DeepseekV4Config(PreTrainedConfig):
     n_routed_experts: int = 256
     routed_scaling_factor: float = 1.5
 
-    # Fields carried from DeepseekV3Config but unused in V4 — kept ``None`` so the
-    # MLA paths never fire (V3 fields that depend on them are guarded by truthiness checks).
+    # V3 fields kept ``None`` so MLA paths in inherited configs never fire.
     kv_lora_rank: int | None = None
     q_lora_rank: int = 1024
     qk_rope_head_dim: int = 64
@@ -97,9 +93,6 @@ class DeepseekV4Config(PreTrainedConfig):
     pretraining_tp: int | None = 1
     tie_word_embeddings: bool = False
 
-    # Rotary config. ``rope_parameters`` (alias ``rope_scaling``) is the HF standard dict;
-    # ``partial_rotary_factor`` tells the shared rope-init path to size cos/sin to
-    # ``qk_rope_head_dim`` instead of the full ``head_dim``.
     rope_parameters: RopeParameters | dict | None = None
     rope_interleave: bool | None = True
     attention_bias: bool = False
@@ -108,7 +101,6 @@ class DeepseekV4Config(PreTrainedConfig):
     scoring_func: str = "sqrtsoftplus"
     rope_theta: float = 10000.0
 
-    # V4-specific.
     compress_ratios: list[int] | None = None
     compress_rope_theta: float = 160000.0
     compress_rope_parameters: dict | None = None
@@ -125,7 +117,6 @@ class DeepseekV4Config(PreTrainedConfig):
     index_topk: int = 512
     num_nextn_predict_layers: int = 1
 
-    # Router-side extras inherited from Mixtral config path.
     output_router_logits: bool = False
     router_aux_loss_coef: float = 0.001
     router_jitter_noise: float = 0.0
@@ -133,9 +124,6 @@ class DeepseekV4Config(PreTrainedConfig):
 
     def __post_init__(self, **kwargs):
         n = self.num_hidden_layers
-        # Upstream configs ship ``num_hidden_layers + num_nextn_predict_layers`` entries
-        # (the trailing MTP entries are for an MTP block we don't instantiate); accept
-        # either length and keep only the first ``num_hidden_layers``.
         if self.compress_ratios is None:
             self.compress_ratios = [0] + [4 if i % 2 else 128 for i in range(max(n - 2, 0))] + ([0] if n >= 2 else [])
         self.compress_ratios = list(self.compress_ratios[:n])
@@ -145,15 +133,10 @@ class DeepseekV4Config(PreTrainedConfig):
             if r not in (0, 4, 128):
                 raise ValueError(f"Unsupported compress_ratio={r}; expected 0, 4, or 128.")
         self.qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
-        # RoPE is only applied to the last ``qk_rope_head_dim`` dims of each head; the
-        # shared rope-init path picks that up from ``partial_rotary_factor``.
         if self.partial_rotary_factor is None:
             self.partial_rotary_factor = self.qk_rope_head_dim / self.head_dim
-        # Skip ``DeepseekV3Config.__post_init__`` — it pins ``head_dim`` to
-        # ``qk_rope_head_dim`` for the MLA rotary, which would stomp V4's head_dim=512.
+        # Skip ``DeepseekV3Config.__post_init__`` (it would pin head_dim to qk_rope_head_dim).
         super().__post_init__(**kwargs)
-        # The compressed-segment rope shares structure with the main dict but overrides
-        # the base ``rope_theta``; build it lazily here so it round-trips through to_dict.
         self.compress_rope_parameters = {**self.rope_parameters, "rope_theta": self.compress_rope_theta}
 
 

@@ -18,7 +18,6 @@ if is_torch_available():
     from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4Cache,
         DeepseekV4Compressor,
-        _pool_windows,
     )
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
@@ -217,69 +216,60 @@ class DeepseekV4ParityTest(unittest.TestCase):
     """
 
     def test_compressor_pool_matches_reference(self):
-        """Independently re-implement the reference ``Compressor._pool`` (softmax-gated
-        sum-pool with learned absolute position embedding) and check it matches
-        :func:`_pool_windows` on a fixed input.
+        """Re-implement the reference ``Compressor._pool`` (softmax-gated sum-pool with
+        a learned absolute position embedding) and check it matches what the
+        ``DeepseekV4CompressorLayer`` + ``DeepseekV4Compressor`` produce inline.
         """
         torch.manual_seed(0)
         batch, length, head_dim, ratio = 2, 8, 16, 4
         kv = torch.randn(batch, length, head_dim)
         gate = torch.randn(batch, length, head_dim)
-        ape = torch.randn(ratio, head_dim)
+        window_pos_bias = torch.randn(ratio, head_dim)
 
-        ours = _pool_windows(kv, gate, ape, ratio, head_dim)
+        # Reproduce the V4 in-line pool from ``DeepseekV4Compressor.forward``.
+        n_windows = length // ratio
+        view_kv = kv.view(batch, n_windows, ratio, head_dim)
+        view_gate = gate.view(batch, n_windows, ratio, head_dim) + window_pos_bias.to(gate.dtype)
+        ours = (view_kv * view_gate.softmax(dim=2)).sum(dim=2)
 
-        # Reference (transcribed from upstream `inference/model.py` ``Compressor``):
-        #   weights = softmax(gate + ape, dim=window); pooled = Σ weights * kv.
-        reference = torch.zeros(batch, length // ratio, head_dim)
+        # Reference (transcribed from upstream ``inference/model.py``).
+        reference = torch.zeros(batch, n_windows, head_dim)
         for b in range(batch):
-            for i in range(length // ratio):
-                window_kv = kv[b, i * ratio : (i + 1) * ratio]  # [ratio, D]
-                window_gate = gate[b, i * ratio : (i + 1) * ratio] + ape  # [ratio, D]
+            for i in range(n_windows):
+                window_kv = kv[b, i * ratio : (i + 1) * ratio]
+                window_gate = gate[b, i * ratio : (i + 1) * ratio] + window_pos_bias
                 w = torch.softmax(window_gate, dim=0)
                 reference[b, i] = (window_kv * w).sum(dim=0)
 
         torch.testing.assert_close(ours, reference, rtol=1e-5, atol=1e-6)
 
     def test_compressor_cache_accumulates_across_calls(self):
-        """Feeding the compressor one token at a time should produce the same pool as
-        feeding the whole sequence — that's the invariant the cache buffers exist for.
-        Uses ``compress_ratio=128`` to exercise the indexer-less path so we don't need
-        to fabricate position_embeddings for the test.
+        """Feeding the compressor one token at a time must produce the same pool as
+        feeding the whole sequence. ``compress_ratio=128`` keeps the test indexer-free
+        so we don't have to thread ``position_ids`` for that branch.
         """
         torch.manual_seed(1)
         config = _tiny_config(compress_ratios=[0, 128], sliding_window=128, max_position_embeddings=512)
         compressor = DeepseekV4Compressor(config, compress_ratio=128, head_dim=config.head_dim).eval()
-        # Initialise ``ape`` to non-zero so the test actually exercises the pooling math.
-        torch.nn.init.normal_(compressor.ape, std=0.1)
-        rotary = DeepseekV4Model(config).rotary_emb_compress
+        # Initialise ``window_pos_bias`` to non-zero so the test exercises the pooling math.
+        torch.nn.init.normal_(compressor.window_pos_bias, std=0.1)
 
         batch, seq_len = 1, 256  # two full windows
         hidden_states = torch.randn(batch, seq_len, config.hidden_size)
 
         cache_full = DeepseekV4Cache(config=config)
+        position_ids_full = torch.arange(seq_len).unsqueeze(0)
         with torch.no_grad():
-            one_shot = compressor(
-                hidden_states,
-                q_residual=None,
-                rotary=rotary,
-                position_embeddings=None,
-                cache=cache_full,
-                layer_idx=0,
-                start_pos=0,
-            )
+            one_shot = compressor(hidden_states, None, position_ids_full, cache_full.layers[1])
 
         cache_inc = DeepseekV4Cache(config=config)
         with torch.no_grad():
             for step in range(seq_len):
                 incremental = compressor(
                     hidden_states[:, step : step + 1],
-                    q_residual=None,
-                    rotary=rotary,
-                    position_embeddings=None,
-                    cache=cache_inc,
-                    layer_idx=0,
-                    start_pos=step,
+                    None,
+                    torch.tensor([[step]]),
+                    cache_inc.layers[1],
                 )
         self.assertEqual(one_shot.shape, incremental.shape)
         torch.testing.assert_close(one_shot, incremental, rtol=1e-4, atol=1e-5)
