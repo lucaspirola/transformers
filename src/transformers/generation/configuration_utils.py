@@ -1677,8 +1677,6 @@ class ContinuousBatchingConfig:
     # This is only used in the flash_attn_with_kvcache fast decode path to dimension the block table. If it is set to 0,
     # the fast decode path will not be used. Currently turned off by default.
     max_blocks_per_request: int | None = 0
-    # If no user-hint is given and decode path is available, this is the default max blocks per request.
-    _fallback_max_blocks_per_request: int = 32
 
     # Block sharing can only be allowed, but never forced: some model just do not support it. If you only have a few
     # short prompts, but long generation lengths, you might want to disable block sharing.
@@ -1724,6 +1722,13 @@ class ContinuousBatchingConfig:
     # When True, processors explicitly marked as unsupported are removed with a warning. When False, all processors
     # are kept but warnings are logged for unsupported/unknown ones.
     drop_unsupported_processors: bool = True
+
+    @property
+    def fallback_max_blocks_per_request(self) -> int:
+        """Returns the fallback max blocks per request. If no user-hint is given and decode path is available, this is
+        the default max blocks per request. With default block size of 256, this means a max sequence length of 8192
+        tokens for the fast decode path."""
+        return 32
 
     def account_for_cb_deprecated_arguments(
         self,
