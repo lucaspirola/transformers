@@ -198,22 +198,16 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
         updated: list = []
         for conv in weight_conversions:
             if isinstance(conv, WeightConverter):
-                weight_sources = [
-                    p for p in conv.source_patterns if p.endswith(".weight") or p.endswith("weight$")
-                ]
+                weight_sources = [p for p in conv.source_patterns if p.endswith(".weight") or p.endswith("weight$")]
                 if weight_sources:
                     anchored_weight = [_anchor(p) for p in weight_sources]
                     scale_sources = [
                         _anchor(
-                            p[: -len(".weight")] + ".weight_scale_inv"
-                            if p.endswith(".weight")
-                            else "weight_scale_inv"
+                            p[: -len(".weight")] + ".weight_scale_inv" if p.endswith(".weight") else "weight_scale_inv"
                         )
                         for p in weight_sources
                     ]
-                    other = [
-                        p for p in conv.source_patterns if not (p.endswith(".weight") or p.endswith("weight$"))
-                    ]
+                    other = [p for p in conv.source_patterns if not (p.endswith(".weight") or p.endswith("weight$"))]
                     new_sources = anchored_weight + scale_sources + other
                     new_ops = [Fp8Dequantize(self)] + list(conv.operations)
                     conv = WeightConverter(

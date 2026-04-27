@@ -581,26 +581,6 @@ def process_source_pattern(source_pattern: str, target_pattern: str) -> str:
     return source_pattern
 
 
-def _compile_source_pattern(pattern: str) -> str:
-    """Compile a :class:`WeightTransform` source pattern into a regex string.
-
-    Raw glob patterns (no regex syntax: no backslashes, anchors, or capture groups) are treated as
-    file globs: every literal character is regex-escaped, ``*`` becomes ``.*``, and the whole thing
-    is wrapped in word boundaries (``\\b...\\b``) so that ``experts.*.w2.weight`` doesn't accidentally
-    fire on ``shared_experts.0.w2.weight`` substrings.
-
-    Patterns that already use regex syntax are passed through with only the legacy ``.*.`` shortcut
-    translated for backward compatibility.
-    """
-    if not any(c in pattern for c in ("\\", "^", "$", "(")):
-        placeholder = "\x00"
-        body = pattern.replace("*", placeholder)
-        body = re.escape(body)
-        body = body.replace(placeholder, ".*")
-        return r"\b" + body + r"\b"
-    return pattern.replace(".*.", r"\..*\.")
-
-
 class WeightTransform:
     # Restrict the attributes that can be attached
     __slots__ = (
@@ -674,7 +654,7 @@ class WeightTransform:
         branches = []
         for i, source_pattern in enumerate(self.source_patterns):
             group_name = f"g{i}"
-            pattern = _compile_source_pattern(source_pattern)
+            pattern = source_pattern.replace(".*.", r"\..*\.")
             branches.append(f"(?P<{group_name}>{pattern})")
         self.compiled_sources = re.compile("|".join(branches))
 
@@ -785,46 +765,6 @@ class WeightRenaming(WeightTransform):
 
     # Needs to be empty, otherwise the class will not be slotted
     __slots__ = ()
-
-    def reverse_transform(self) -> WeightTransform:
-        """Build the inverse rename by translating regex source ↔ substitution target.
-
-        The base class's ``reverse_transform`` just swaps ``source_patterns`` and ``target_patterns``,
-        which only works when both sides happen to be valid in both roles (e.g. ``PrefixChange``).
-        For general renames with regex syntax, we must:
-          * translate capture groups ``(...)`` in the original source into backref placeholders
-            ``\\1``, ``\\2`` in the new substitution target;
-          * translate backref placeholders ``\\N`` in the original target into capture groups in
-            the new regex source, and re-escape literal regex metacharacters.
-
-        Doesn't handle non-capturing groups ``(?:...)``, named groups, or nested groups — none of
-        which appear in current conversion mappings.
-        """
-        if self.quantization_operation is not None:
-            raise ValueError("Cannot reverse the transform with quantization")
-
-        original_source = self._original_source_patterns[0]
-        original_target = self._original_target_patterns[0]
-
-        # New target = original source with `(...)` replaced by `\N` (in order), anchors stripped,
-        # and literal regex chars unescaped.
-        body = original_source.removeprefix("^").removesuffix("$")
-        counter = [0]
-
-        def _to_backref(_match):
-            counter[0] += 1
-            return f"\\{counter[0]}"
-
-        new_target = re.sub(r"\((?!\?)[^()]*\)", _to_backref, body)
-        new_target = re.sub(r"\\([.+*?^$|(){}\[\]\\])", r"\1", new_target)
-
-        # New source = original target with literal regex chars escaped and `\N` turned into a
-        # permissive non-greedy capture group ``(.+?)``.
-        new_source = re.escape(original_target)
-        new_source = re.sub(r"\\\\(\d+)", lambda _match: "(.+?)", new_source)
-        new_source = "^" + new_source + "$"
-
-        return WeightRenaming(source_patterns=new_source, target_patterns=new_target)
 
     def convert(
         self,

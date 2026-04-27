@@ -908,7 +908,6 @@ class Fp8Dequantize(ConversionOps):
             scale = base + "_scale_inv"
         return scale + "$" if anchored else scale
 
-
     # E2M1 (FP4) value table — checkpoints sometimes ship MoE experts as packed FP4
     # (two e2m1 nibbles per int8 byte), so the "weight" dtype lands as ``int8`` /
     # ``float4_e2m1fn_x2`` and we have to unpack before applying the scale grid.
