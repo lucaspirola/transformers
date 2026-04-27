@@ -825,6 +825,17 @@ class DeepseekV4HyperConnection(nn.Module):
         self.scale = nn.Parameter(torch.empty(3))
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""
+        project it onto the manifold of doubly stochastic matrices M.
+        This is achieved by the Sinkhorn-Knopp algorithm, which first applies an exponential function
+        ˜
+        to
+        𝐵𝑙 to ensure positivity, getting 𝑀(0) = exp(˜
+        𝐵𝑙), and then iteratively performs column and row
+        normalization:
+        𝑀(𝑡) = T𝑟(T𝑐(𝑀(𝑡−1))), (8)
+        where T𝑟 and T𝑐 denote row and column normalization, respectively.
+        """
         flat = hidden_streams.flatten(start_dim=2).float()
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         mix = F.linear(flat, self.fn.float()) * rsqrt  # [B, S, (2+H)*H]
@@ -862,11 +873,6 @@ class DeepseekV4HyperHead(nn.Module):
         mixes = F.linear(flat, self.hc_fn.float()) * rsqrt
         pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
-
-
-# -----------------------------------------------------------------------------
-# MoE: shared MLP + routed experts + two router flavours.
-# -----------------------------------------------------------------------------
 
 
 class DeepseekV4MLP(Qwen2MoeMLP):
@@ -1012,11 +1018,6 @@ class DeepseekV4SparseMoeBlock(nn.Module):
         return routed + self.shared_experts(residual)
 
 
-# -----------------------------------------------------------------------------
-# Decoder layer.
-# -----------------------------------------------------------------------------
-
-
 class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
     r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
     two places:
@@ -1038,7 +1039,7 @@ class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
         h ──► norm ──► self_attn ──► + ──► norm ──► mlp ──► +
         └──────── residual ────────┘   └─────── residual ───┘
 
-    V4 decoder layer (``H = hc_mult`` parallel residual streams throughout)::
+    Deepseek V4 decoder layer (``H = hc_mult`` parallel residual streams throughout)::
 
                 attention site                                    mlp site
         ┌────────────────────────────────────────┐    ┌────────────────────────────────────────┐
@@ -1058,8 +1059,7 @@ class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
         │  new hidden_streams  ──────────────────┘    │  new hidden_streams                    │
         └────────────────────────────────────────┘    └────────────────────────────────────────┘
 
-    Checkpoint keys (``hc_attn_*`` / ``hc_ffn_*`` from the upstream reference) are bridged
-    to the ``attn_hc.*`` / ``ffn_hc.*`` module tree via ``conversion_mapping.py``.
+
     """
 
     def __init__(self, config: DeepseekV4Config, layer_idx: int):
