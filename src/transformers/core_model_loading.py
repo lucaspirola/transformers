@@ -581,26 +581,6 @@ def process_source_pattern(source_pattern: str, target_pattern: str) -> str:
     return source_pattern
 
 
-def _compile_source_pattern(pattern: str) -> str:
-    """Compile a :class:`WeightTransform` source pattern into a regex string.
-
-    Raw glob patterns (no regex syntax: no backslashes, anchors, or capture groups) are treated as
-    file globs: every literal character is regex-escaped, ``*`` becomes ``.*``, and the whole thing
-    is wrapped in word boundaries (``\\b...\\b``) so that ``experts.*.w2.weight`` doesn't accidentally
-    fire on ``shared_experts.0.w2.weight`` substrings.
-
-    Patterns that already use regex syntax are passed through with only the legacy ``.*.`` shortcut
-    translated for backward compatibility.
-    """
-    if not any(c in pattern for c in ("\\", "^", "$", "(")):
-        placeholder = "\x00"
-        body = pattern.replace("*", placeholder)
-        body = re.escape(body)
-        body = body.replace(placeholder, ".*")
-        return r"\b" + body + r"\b"
-    return pattern.replace(".*.", r"\..*\.")
-
-
 class WeightTransform:
     # Restrict the attributes that can be attached
     __slots__ = (
@@ -674,7 +654,7 @@ class WeightTransform:
         branches = []
         for i, source_pattern in enumerate(self.source_patterns):
             group_name = f"g{i}"
-            pattern = _compile_source_pattern(source_pattern)
+            pattern = source_pattern.replace(".*.", r"\..*\.")
             branches.append(f"(?P<{group_name}>{pattern})")
         self.compiled_sources = re.compile("|".join(branches))
 
