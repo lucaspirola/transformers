@@ -908,11 +908,6 @@ class Fp8Dequantize(ConversionOps):
             scale = base + "_scale_inv"
         return scale + "$" if anchored else scale
 
-    @staticmethod
-    def _is_scale_key(key: str) -> bool:
-        base = key.removesuffix("$")
-        return base.endswith("weight_scale_inv") or base == "activation_scale"
-
     # E2M1 (FP4) value table — checkpoints sometimes ship MoE experts as packed FP4
     # (two e2m1 nibbles per int8 byte), so the "weight" dtype lands as ``int8`` /
     # ``float4_e2m1fn_x2`` and we have to unpack before applying the scale grid.
@@ -977,7 +972,7 @@ class Fp8Dequantize(ConversionOps):
         # Generic chain path: dequantize every weight pattern that has a sibling scale.
         result: dict[str, list[torch.Tensor] | torch.Tensor] = {}
         for key, value in input_dict.items():
-            if self._is_scale_key(key):
+            if "activation_scale" in key or "weight_scale_inv" in key:
                 continue  # consumed by the dequant; drop from the chain
             scale_key = self._scale_pattern_for(key)
             if scale_key not in input_dict:

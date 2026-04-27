@@ -121,6 +121,7 @@ class DeepseekV4Config(PreTrainedConfig):
     partial_rotary_factor: float | None = None
 
     def __post_init__(self, **kwargs):
+        super().__post_init__(**kwargs)
         n = self.num_hidden_layers
         if self.compress_ratios is None:
             self.compress_ratios = [0] + [4 if i % 2 else 128 for i in range(max(n - 2, 0))] + ([0] if n >= 2 else [])
@@ -133,8 +134,6 @@ class DeepseekV4Config(PreTrainedConfig):
         self.qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if self.partial_rotary_factor is None:
             self.partial_rotary_factor = self.qk_rope_head_dim / self.head_dim
-        # Skip ``DeepseekV3Config.__post_init__`` (it would pin head_dim to qk_rope_head_dim).
-        super().__post_init__(**kwargs)
         # Normalize rope_parameters into a per-layer-type dict ``{"main": {...}, "compress": {...}}``
         # (Gemma3 pattern). Idempotent across save/load: round-tripping preserves structure.
         rp = self.rope_parameters or {}
