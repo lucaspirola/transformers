@@ -766,46 +766,6 @@ class WeightRenaming(WeightTransform):
     # Needs to be empty, otherwise the class will not be slotted
     __slots__ = ()
 
-    def reverse_transform(self) -> WeightTransform:
-        """Build the inverse rename by translating regex source ↔ substitution target.
-
-        The base class's ``reverse_transform`` just swaps ``source_patterns`` and ``target_patterns``,
-        which only works when both sides happen to be valid in both roles (e.g. ``PrefixChange``).
-        For general renames with regex syntax, we must:
-          * translate capture groups ``(...)`` in the original source into backref placeholders
-            ``\\1``, ``\\2`` in the new substitution target;
-          * translate backref placeholders ``\\N`` in the original target into capture groups in
-            the new regex source, and re-escape literal regex metacharacters.
-
-        Doesn't handle non-capturing groups ``(?:...)``, named groups, or nested groups — none of
-        which appear in current conversion mappings.
-        """
-        if self.quantization_operation is not None:
-            raise ValueError("Cannot reverse the transform with quantization")
-
-        original_source = self._original_source_patterns[0]
-        original_target = self._original_target_patterns[0]
-
-        # New target = original source with `(...)` replaced by `\N` (in order), anchors stripped,
-        # and literal regex chars unescaped.
-        body = original_source.removeprefix("^").removesuffix("$")
-        counter = [0]
-
-        def _to_backref(_match):
-            counter[0] += 1
-            return f"\\{counter[0]}"
-
-        new_target = re.sub(r"\((?!\?)[^()]*\)", _to_backref, body)
-        new_target = re.sub(r"\\([.+*?^$|(){}\[\]\\])", r"\1", new_target)
-
-        # New source = original target with literal regex chars escaped and `\N` turned into a
-        # permissive non-greedy capture group ``(.+?)``.
-        new_source = re.escape(original_target)
-        new_source = re.sub(r"\\\\(\d+)", lambda _match: "(.+?)", new_source)
-        new_source = "^" + new_source + "$"
-
-        return WeightRenaming(source_patterns=new_source, target_patterns=new_target)
-
     def convert(
         self,
         layer_name: str,
