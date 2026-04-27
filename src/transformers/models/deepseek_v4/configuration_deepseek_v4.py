@@ -18,21 +18,45 @@ from ...modeling_rope_utils import RopeParameters
 from ...utils import auto_docstring
 
 
+DEEPSEEK_V4_LAYER_TYPES = (
+    "sliding_attention",
+    "compressed_sparse_attention",
+    "heavily_compressed_attention",
+)
+
+
 @auto_docstring(checkpoint="deepseek-ai/DeepSeek-V4-Flash-Base")
 @strict
 class DeepseekV4Config(PreTrainedConfig):
     r"""
-    compress_ratios (`list[int]`): Per-layer compression schedule in ``{0, 4, 128}``.
-        ``0`` = pure local SWA; ``4`` = overlap-window compress + Indexer; ``128`` = disjoint-window compress.
-    compress_rope_theta (`float`): RoPE base for Compressor layers (paired with ``rope_scaling`` for YaRN).
-    hc_mult (`int`): Hyper-Connection stream count (always active).
-    num_hash_layers (`int`): First N layers route via a frozen ``tid2eid[input_ids]`` lookup.
+    DeepSeek-V4's hybrid attention follows the paper (Section 2.3): every block is one
+    of three attention types — *Full Attention* (sliding-window only), *Compressed
+    Sparse Attention* (CSA, Section 2.3.1) and *Heavily Compressed Attention* (HCA,
+    Section 2.3.2). CSA compresses the KV cache by ``compress_rate_csa`` (m=4 in V4-
+    Flash/Pro) and selects ``index_topk`` blocks per query via the Lightning Indexer;
+    HCA applies a much heavier compression of ``compress_rate_hca`` (m'=128) and
+    skips sparse selection. Both branches add a small uncompressed sliding-window
+    branch for fine-grained locality.
+
+    layer_types (`list[str]`): Per-layer attention schedule with values from
+        ``{"sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention"}``.
+        V4-Flash defaults: 2× full + interleaved CSA / HCA.
+    compress_rate_csa (`int`): m, the CSA compression rate (default 4).
+    compress_rate_hca (`int`): m', the HCA compression rate (default 128).
+    compress_rope_theta (`float`): RoPE base for the compressed branches (paired with
+        ``rope_scaling`` for YaRN).
+    hc_mult (`int`): Manifold-Constrained Hyper-Connection (mHC) expansion factor n_hc
+        (always active; Section 2.2).
+    hc_sinkhorn_iters (`int`): Sinkhorn-Knopp iterations t_max for the mHC residual
+        mapping projection onto doubly-stochastic matrices.
+    hc_eps (`float`): Numerical floor for the Sinkhorn-Knopp normalization.
+    num_hash_layers (`int`): First N MoE layers route via a frozen ``tid2eid[input_ids]`` lookup.
     scoring_func (`str`): Router activation — ``sqrtsoftplus``, ``softmax``, or ``sigmoid``.
     swiglu_limit (`float`): Clip routed experts' gate/up pre-activations.
-    sliding_window (`int`): Local window size used on every layer.
-    o_groups (`int`), o_lora_rank (`int`): Grouped low-rank output projection.
-    index_n_heads, index_head_dim, index_topk (`int`): Indexer hyperparameters.
-    hc_sinkhorn_iters (`int`), hc_eps (`float`): Sinkhorn normalisation knobs.
+    sliding_window (`int`): Local window size n_win used in every attention block's
+        sliding-window branch.
+    o_groups (`int`), o_lora_rank (`int`): Grouped low-rank output projection (g, d_g).
+    index_n_heads, index_head_dim, index_topk (`int`): Lightning Indexer hyperparameters.
     num_nextn_predict_layers (`int`): MTP layer count in the upstream checkpoint (not instantiated here).
     """
 
@@ -100,7 +124,9 @@ class DeepseekV4Config(PreTrainedConfig):
     scoring_func: str = "sqrtsoftplus"
     rope_theta: float = 10000.0
 
-    compress_ratios: list[int] | None = None
+    layer_types: list[str] | None = None
+    compress_rate_csa: int = 4
+    compress_rate_hca: int = 128
     compress_rope_theta: float = 160000.0
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
@@ -123,14 +149,20 @@ class DeepseekV4Config(PreTrainedConfig):
     def __post_init__(self, **kwargs):
         super().__post_init__(**kwargs)
         n = self.num_hidden_layers
-        if self.compress_ratios is None:
-            self.compress_ratios = [0] + [4 if i % 2 else 128 for i in range(max(n - 2, 0))] + ([0] if n >= 2 else [])
-        self.compress_ratios = list(self.compress_ratios[:n])
-        if len(self.compress_ratios) != n:
-            raise ValueError(f"`compress_ratios` must cover at least {n} layers, got {len(self.compress_ratios)}.")
-        for r in self.compress_ratios:
-            if r not in (0, 4, 128):
-                raise ValueError(f"Unsupported compress_ratio={r}; expected 0, 4, or 128.")
+        if self.layer_types is None:
+            # V4-Flash default: two full-attention bootstrap layers, then CSA / HCA interleaved.
+            interleave = [
+                "compressed_sparse_attention" if i % 2 else "heavily_compressed_attention"
+                for i in range(max(n - 2, 0))
+            ]
+            head = ["sliding_attention"] * min(n, 2)
+            self.layer_types = head + interleave
+        self.layer_types = list(self.layer_types[:n])
+        if len(self.layer_types) != n:
+            raise ValueError(f"`layer_types` must cover at least {n} layers, got {len(self.layer_types)}.")
+        for layer_type in self.layer_types:
+            if layer_type not in DEEPSEEK_V4_LAYER_TYPES:
+                raise ValueError(f"Unsupported layer_type={layer_type!r}; expected one of {DEEPSEEK_V4_LAYER_TYPES}.")
         self.qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if self.partial_rotary_factor is None:
             self.partial_rotary_factor = self.qk_rope_head_dim / self.head_dim

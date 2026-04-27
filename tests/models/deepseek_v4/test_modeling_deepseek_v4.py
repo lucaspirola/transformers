@@ -54,7 +54,7 @@ class DeepseekV4ModelTester(CausalLMModelTester):
         # ``CausalLMModelTest`` can exercise the model without running into the hash
         # router's ``input_ids`` requirement. A dedicated test covers the hash path.
         self.num_hash_layers = 0
-        self.compress_ratios = [0, 4]
+        self.layer_types = ["sliding_attention", "compressed_sparse_attention"]
         self.sliding_window = 8
         self.hc_mult = 2
         self.hc_sinkhorn_iters = 3
@@ -193,7 +193,7 @@ def _tiny_config(**overrides):
         "num_attention_heads": 4,
         "num_key_value_heads": 1,
         "num_hidden_layers": 2,
-        "compress_ratios": [0, 4],
+        "layer_types": ["sliding_attention", "compressed_sparse_attention"],
         "sliding_window": 4,
         "hc_mult": 2,
         "hc_sinkhorn_iters": 3,
@@ -232,27 +232,27 @@ class DeepseekV4ParityTest(unittest.TestCase):
 
     def test_compressor_pool_matches_reference(self):
         """Re-implement the reference ``Compressor._pool`` (softmax-gated sum-pool with
-        a learned absolute position embedding) and check it matches what the
-        ``DeepseekV4CompressorLayer`` + ``DeepseekV4Compressor`` produce inline.
+        a learned absolute position embedding) and check it matches what the V4
+        :class:`DeepseekV4HCALayer` + :class:`DeepseekV4Compressor` produce inline.
         """
         torch.manual_seed(0)
-        batch, length, head_dim, ratio = 2, 8, 16, 4
+        batch, length, head_dim, rate = 2, 8, 16, 4
         kv = torch.randn(batch, length, head_dim)
         gate = torch.randn(batch, length, head_dim)
-        window_pos_bias = torch.randn(ratio, head_dim)
+        window_pos_bias = torch.randn(rate, head_dim)
 
         # Reproduce the V4 in-line pool from ``DeepseekV4Compressor.forward``.
-        n_windows = length // ratio
-        view_kv = kv.view(batch, n_windows, ratio, head_dim)
-        view_gate = gate.view(batch, n_windows, ratio, head_dim) + window_pos_bias.to(gate.dtype)
+        n_windows = length // rate
+        view_kv = kv.view(batch, n_windows, rate, head_dim)
+        view_gate = gate.view(batch, n_windows, rate, head_dim) + window_pos_bias.to(gate.dtype)
         ours = (view_kv * view_gate.softmax(dim=2)).sum(dim=2)
 
         # Reference (transcribed from upstream ``inference/model.py``).
         reference = torch.zeros(batch, n_windows, head_dim)
         for b in range(batch):
             for i in range(n_windows):
-                window_kv = kv[b, i * ratio : (i + 1) * ratio]
-                window_gate = gate[b, i * ratio : (i + 1) * ratio] + window_pos_bias
+                window_kv = kv[b, i * rate : (i + 1) * rate]
+                window_gate = gate[b, i * rate : (i + 1) * rate] + window_pos_bias
                 w = torch.softmax(window_gate, dim=0)
                 reference[b, i] = (window_kv * w).sum(dim=0)
 
@@ -260,12 +260,17 @@ class DeepseekV4ParityTest(unittest.TestCase):
 
     def test_compressor_cache_accumulates_across_calls(self):
         """Feeding the compressor one token at a time must produce the same pool as
-        feeding the whole sequence. ``compress_ratio=128`` keeps the test indexer-free
-        so we don't have to thread ``position_ids`` for that branch.
+        feeding the whole sequence. Using an HCA-only schedule keeps the test
+        indexer-free so we don't have to thread ``position_ids`` for that branch.
         """
         torch.manual_seed(1)
-        config = _tiny_config(compress_ratios=[0, 128], sliding_window=128, max_position_embeddings=512)
-        compressor = DeepseekV4Compressor(config, compress_ratio=128, head_dim=config.head_dim).eval()
+        config = _tiny_config(
+            layer_types=["sliding_attention", "heavily_compressed_attention"],
+            sliding_window=128,
+            max_position_embeddings=512,
+            compress_rate_hca=128,
+        )
+        compressor = DeepseekV4Compressor(config, compress_rate=128, with_indexer=False).eval()
         # Initialise ``window_pos_bias`` to non-zero so the test exercises the pooling math.
         torch.nn.init.normal_(compressor.window_pos_bias, std=0.1)
 
