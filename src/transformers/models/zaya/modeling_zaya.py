@@ -1648,11 +1648,21 @@ class ZayaModel(ZayaPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
+                # PATCH: the original gradient_checkpointing call passed positional
+                # args in an order that DIDN'T match decoder_layer.forward's
+                # signature. Specifically position_embeddings (slot 9) ended up
+                # receiving prev_router_hidden_states (None on first layer),
+                # which then broke `cos, sin = position_embeddings` at line 544.
+                # The decoder_layer.forward positional order is:
+                #   hidden_states, residual, attention_mask, cca_mask, position_ids,
+                #   past_key_values, output_attentions, use_cache, cache_position,
+                #   position_embeddings, prev_router_hidden_states
                 layer_outputs, residual, prev_router_hidden_states = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
                     residual,
                     causal_mask,
+                    cca_mask,
                     position_ids,
                     past_key_values,
                     output_attentions,
@@ -1660,7 +1670,6 @@ class ZayaModel(ZayaPreTrainedModel):
                     cache_position,
                     emb_to_use,
                     prev_router_hidden_states,
-                    cca_mask,
                 )
             else:
                 layer_outputs, residual, prev_router_hidden_states = decoder_layer(
