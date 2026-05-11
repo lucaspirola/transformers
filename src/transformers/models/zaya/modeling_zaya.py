@@ -947,7 +947,29 @@ class ZayaRouter(nn.Module):
         self.num_experts = (num_moe_experts + 1) if self.use_mod else num_moe_experts
         self.topk = int(moe_router_topk)
 
-        # Router hidden dim
+        # Router hidden dim.
+        # PATCH: the ZAYA1-reasoning-base checkpoint config ships
+        # `zaya_mlp_expansion` as an alternating list (e.g. [0, 256, 0, 256, ...]),
+        # passed through unchanged from ZayaModel → ZayaDecoderMLPLayer → ZayaBlock.
+        # The unique nonzero is the actual expansion that every router uses.
+        if isinstance(mlp_expansion, (list, tuple)):
+            nonzero = {v for v in mlp_expansion if v}
+            if len(nonzero) == 1:
+                mlp_expansion = nonzero.pop()
+            elif len(nonzero) > 1:
+                ln = layer_number if layer_number is not None else 0
+                if 0 <= ln < len(mlp_expansion) and mlp_expansion[ln]:
+                    mlp_expansion = mlp_expansion[ln]
+                else:
+                    raise ValueError(
+                        f"ZayaRouter: cannot resolve mlp_expansion at "
+                        f"layer_number={ln} from heterogeneous list of "
+                        f"length {len(mlp_expansion)}"
+                    )
+            else:
+                raise ValueError(
+                    "ZayaRouter: zaya_mlp_expansion list is all zeros"
+                )
         self.mlp_expansion = int(mlp_expansion)
 
         # ---- Layers ----
