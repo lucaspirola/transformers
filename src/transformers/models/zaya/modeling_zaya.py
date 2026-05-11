@@ -355,7 +355,11 @@ class CCA(nn.Module):
         qk_mean_q = (query_pre + key_pre) / 2
         qk_mean_k = qk_mean_q.view(*qk_mean_q.shape[:2], self.num_kv_heads, self.gqa_groups, -1).mean(dim=-2)
 
-        if past_key_values is not None:
+        # PATCH: during training, callers pass `use_cache=False` but the fork
+        # still threads a `bool` through `past_key_values` instead of `None` —
+        # `bool` has no `.has_previous_state`. Treat any non-cache value as
+        # "no cache" so training paths short-circuit cleanly.
+        if past_key_values is not None and not isinstance(past_key_values, bool):
             if past_key_values.has_previous_state:
                 # Generation
                 qk_packed0 = qk_packed0.transpose(0, 1)  # [B, 1, H]
@@ -405,7 +409,9 @@ class CCA(nn.Module):
 
         # Values from the two time streams
         v1 = self.val_proj1(hs)  # [S, B, latent_k_dim/2]
-        if past_key_values is not None:
+        # PATCH: same as line 358 — see comment there. `past_key_values` may
+        # arrive as a `bool` during training; guard before .has_previous_state.
+        if past_key_values is not None and not isinstance(past_key_values, bool):
             if past_key_values.has_previous_state:
                 # Generation
                 # [B, H]
